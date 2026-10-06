@@ -200,6 +200,37 @@ tools/some-onnx/packaging/         PyInstaller specifications
 tools/some-onnx/runtime/           EXE, DLL, FFmpeg, and model files
 ```
 
+## Security Notes for Server Administrators
+
+This mod starts native programs on the server host. A Forge JAR should not be assumed to have no host-level security impact: the integrated server process normally has access to files permitted to its operating-system account, and child executables inherit that account's permissions. The current implementation does not use an OS sandbox, container isolation, or a separate low-privilege account. It also does not impose a hard limit on conversion concurrency or CPU use. Install it only if you trust the source, have reviewed the release you are deploying, and understand its runtime behavior.
+
+### Why executables and DLLs are extracted
+
+The JAR bundles fixed versions of `audio_to_midi.exe`, `midi_to_nbt.exe`, FFmpeg, ONNX Runtime DLLs, and the `nmp.onnx` weights. During initialization, the mod copies these resources into a newly created `RedStoneMusic-*` working directory under the system temporary directory. Windows tools and DLLs need ordinary filesystem paths for execution and loading. These files are bundled resources, not downloaded from the network or extracted from song input. The mod launches the two specified executables with `ProcessBuilder` argument lists rather than building a shell command string.
+
+### File access and cleanup scope
+
+- Input is selected from `config/RedStoneMusic/mp3/`; `.mp3` and `.wav` are accepted. Filename resolution rejects path separators and path traversal.
+- `audio_to_midi.exe` reads the selected audio, invokes the bundled FFmpeg decoder, runs inference using the bundled ONNX model, and writes an intermediate Standard MIDI file.
+- `midi_to_nbt.exe` reads that MIDI and writes a compressed Minecraft Structure NBT file to `config/RedStoneMusic/ntb/`. This is the final conversion result and is intentionally retained.
+- The intermediate MIDI file and per-job directory are deleted when that conversion job finishes. The final NBT is not deleted. Runtime tools, model weights, and DLLs remain in the tool working directory so they can be reused after leaving a world; a JVM shutdown hook attempts to remove that directory when Minecraft exits normally.
+- Cleanup is best-effort. A crash, power loss, or locked file can leave temporary files behind. After confirming Minecraft is closed, administrators can inspect and remove this mod's temporary directories whose names start with `RedStoneMusic-`.
+- The mod logs commands and tool output. Do not place sensitive private audio on a server, and protect tool logs according to the server's log-handling policy.
+
+### CPU spikes and concurrency
+
+Basic Pitch ONNX inference and FFmpeg decoding are compute-intensive, so a noticeable CPU spike while a conversion is running is expected; it should not be interpreted as continuous idle activity. Conversions run on background threads, but the current implementation uses a cached thread pool and has no configured maximum concurrency, per-player rate limit, CPU quota, or timeout. Multiple authorized players can therefore start simultaneous inference jobs that compete for CPU, memory, and disk I/O. Grant command permission only to trusted players. For multiplayer or high-load servers, restrict access to a small set of trusted operators and apply OS-level resource limits before production deployment. Minecraft permission level 2 is a command authorization check, not an OS sandbox.
+
+### Deployment and verification recommendations
+
+- Obtain the JAR from the project's designated GitHub repository or build it yourself. Do not load unknown, repackaged, or unverifiable releases.
+- Review the JAR contents, source, and dependencies on an isolated test server before production deployment, and scan downloaded files with trusted endpoint-protection software.
+- Run Minecraft under a dedicated, low-privilege OS account. Grant only the filesystem access needed for the game, configuration, and temporary directories; do not run the server as Administrator/root.
+- Restrict the server process's filesystem permissions to game data. For stronger isolation, use OS account separation, a container, or a virtual machine, and impose external quotas for CPU, memory, process count, and temporary disk space.
+- On multiplayer servers, grant conversion permission only to trusted users. Monitor conversion logs, CPU/memory, and the temporary directory; back up structures in `config/RedStoneMusic/ntb/` that must be retained.
+
+These notes describe the current implementation. They are not a security audit or a guarantee that third-party runtime components are vulnerability-free. The native executables, DLLs, FFmpeg, ONNX Runtime, model, and packaged Python dependencies all expand the software supply chain that administrators should verify.
+
 ## License and Third-Party Components
 
 The repository contains Forge mod code, the Basic Pitch inference pipeline, and the redstone structure generator. Third-party tools retain their original licenses and author information; users must comply with the corresponding terms.
