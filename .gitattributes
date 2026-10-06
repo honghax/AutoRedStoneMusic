@@ -5,3 +5,4 @@ src/generated/**/.cache/cache text eol=lf
 src/generated/**/*.json text eol=lf
 tools/some-onnx/runtime/*.exe filter=lfs diff=lfs merge=lfs -text
 tools/some-onnx/runtime/*.dll filter=lfs diff=lfs merge=lfs -text
+*.mp4 filter=lfs diff=lfs merge=lfs -text
