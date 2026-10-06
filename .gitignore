@@ -1,0 +1,36 @@
+# Gradle and Forge runtime
+.gradle/
+build/
+run/
+
+# IDE and local tooling
+.idea/
+.vscode/
+*.iml
+
+# Python environments and generated files
+tools/some-onnx/.venv/
+tools/some-onnx/__pycache__/
+tools/some-onnx/src/__pycache__/
+tools/some-onnx/cpp-build/
+tools/some-onnx/dist/
+tools/some-onnx/test/
+tools/some-onnx/*.log
+
+# Hyperchoron upstream examples and generated files
+tools/hyperchoron/examples/
+tools/hyperchoron/target/
+tools/hyperchoron/dist/
+tools/hyperchoron/__pycache__/
+tools/hyperchoron/latest.log
+
+# Local test media and generated outputs
+*.mp3
+*.mp4
+*.wav
+*.mid
+*.schem
+*.litematic
+*.nbs
+*.mcfunction
+build-setup.log

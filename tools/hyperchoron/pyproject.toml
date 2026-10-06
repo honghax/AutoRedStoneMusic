@@ -1,0 +1,61 @@
+# pyproject.toml
+[build-system]
+requires = [
+	"setuptools",
+	"setuptools-rust",
+]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hyperchoron"
+readme = "README.md"
+version = "1.1.17"
+authors = [
+	{name = "Thomas Xin", email = "thomasxin@gmail.com"},
+]
+license = "MIT AND (Apache-2.0 OR BSD-2-Clause)"
+requires-python = ">=3.10"
+dependencies = [
+	"json5>=0.12.0",
+	"litemapy>=0.11.0b0",
+	"mcschematic>=11.4.3",
+	"nbtlib>=2.0.4",
+	"numpy>=2.2.6",
+	"orjson>=3.11.3",
+	"py_midicsv>=4.1.2",
+	"py7zr>=1.0.0",
+	"pynbs>=1.1.0",
+	"scipy>=1.16.1",
+	"tqdm>=4.67.1",
+]
+classifiers = [
+	"Programming Language :: Python :: 3",
+	"Programming Language :: Python :: 3.10",
+	"Programming Language :: Python :: 3.11",
+	"Programming Language :: Python :: 3.12",
+	"Programming Language :: Python :: 3.13",
+	"Programming Language :: Python :: Implementation :: CPython",
+	"Programming Language :: Rust",
+]
+[project.optional-dependencies]
+pcm = [
+	"audiotsm>=0.1.2",
+	"audio-separator>=0.34.1",
+	"imageio-ffmpeg>=0.6.0",
+	"librosa>=0.11.0",
+]
+[project.scripts]
+hyperchoron = "hyperchoron.__main__:main"
+[project.urls]
+Homepage = "https://github.com/thomas-xin/hyperchoron"
+Issues = "https://github.com/thomas-xin/hyperchoron/issues"
+
+[tool.setuptools]
+packages = ["hyperchoron", "hyperchoron.templates"]
+include-package-data = true
+
+[[tool.setuptools-rust.ext-modules]]
+target = "hyperchoron.fastmidi"
+path = "Cargo.toml"
+binding = "PyO3"
+py-limited-api = "cp310"
