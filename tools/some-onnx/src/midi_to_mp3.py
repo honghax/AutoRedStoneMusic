@@ -38,10 +38,10 @@ def midi_to_notes(path):
             if msg.type == "set_tempo":
                 tempo = msg.tempo
             elif msg.type == "note_on" and msg.velocity > 0:
-                pending[msg.note] = now
+                pending[(msg.channel, msg.note)] = now
             elif msg.type in ("note_off", "note_on"):
-                if msg.note in pending:
-                    start = pending.pop(msg.note)
+                if (msg.channel, msg.note) in pending:
+                    start = pending.pop((msg.channel, msg.note))
                     if now > start:
                         notes.append((msg.note, start, now - start))
     notes.sort(key=lambda x: x[1])

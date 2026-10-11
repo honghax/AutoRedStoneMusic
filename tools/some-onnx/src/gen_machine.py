@@ -55,6 +55,14 @@ INSTRUMENT_BANKS = (
     ('harp', 'minecraft:dirt', 54),            # F#3..F#5（dirt 即 harp 材质）
     ('bell', 'minecraft:gold_block', 78),      # F#5..F#7
 )
+# 多音轨模式每轨固定档位：同一轨所有音符固定一个档，音程只在校准折回点断裂，
+# 避免跨档 ±24 半音的整体音程扭曲（见 build_pitch_map）。drums 音高仅作节奏参考。
+TRACK_BANKS = {
+    'drums': INSTRUMENT_BANKS[1],   # 中档（垫块/音色仍被 TRACK_MATERIALS/INSTRUMENTS 覆盖为 stone/basedrum）
+    'bass': INSTRUMENT_BANKS[0],    # 低档 bass
+    'other': INSTRUMENT_BANKS[1],   # 中档 harp
+    'vocals': INSTRUMENT_BANKS[1],  # 中档 harp
+}
 DIRS = {'east': (1, 0), 'west': (-1, 0), 'south': (0, 1), 'north': (0, -1)}
 WIRE_CONNECTABLE = ('minecraft:redstone_wire', 'minecraft:repeater',
                     'minecraft:observer', 'minecraft:lever')
@@ -67,7 +75,10 @@ TIMING_TOL_TICKS = 10         # 抽头/发声刻数允许的绝对误差（游�
 # MIDI 读取 / 音高映射
 # --------------------------------------------------------------------------- #
 def load_notes(path):
-    """返回 [(midi 音高, 起始秒, 结束秒), ...]（遍历所有轨道，逐轨维护 tempo）。"""
+    """返回 [(midi 音高, 起始秒, 结束秒), ...]（遍历所有轨道，逐轨维护 tempo）。
+
+    按键用 (channel, note)：合并 MIDI（merge_midis.py）可能在不同 channel 放同音高音符。
+    """
     mf = mido.MidiFile(str(path))
     out = []
     for tr in mf.tracks:
@@ -79,31 +90,37 @@ def load_notes(path):
             if msg.type == 'set_tempo':
                 tempo = msg.tempo
             elif msg.type == 'note_on' and msg.velocity > 0:
-                pending[msg.note] = now
+                pending[(msg.channel, msg.note)] = now
             elif msg.type in ('note_off', 'note_on'):
-                if msg.note in pending:
-                    start = pending.pop(msg.note)
+                if (msg.channel, msg.note) in pending:
+                    start = pending.pop((msg.channel, msg.note))
                     if now > start:
                         out.append((msg.note, start, now))
     out.sort(key=lambda x: x[1])
     return out
 
 
-def build_pitch_map(pitches):
-    """按中位数对齐到 harp 音域中心，返回 (映射函数, 中位数, 移调量)。
+def build_pitch_map(pitches, track=None):
+    """按中位数对齐到档位中心，返回 (映射函数, 中位数, 移调量)。
 
-    映射函数 f(p) -> (instrument, 垫块, note 0..24)：以 harp(F#3~F#5) 为中间档，
-    偏低走 bass(F#1~F#3)、偏高走 bell(F#5~F#7)（借鉴 hyperchoron 的垫块分档）。
-    只有超出 F#1~F#7 整体音域的极端音，才在档内按八度折回。
+    单轨（track=None）：以 harp(F#3~F#5) 为中间档，偏低走 bass、偏高走 bell
+    （借鉴 hyperchoron 的垫块分档）。只有超出 F#1~F#7 整体音域的极端音，才在档内按八度折回。
+    多轨（track 指定）：固定到 TRACK_BANKS[track] 档位，移调对齐到该档中心，
+    同轨所有音符位移恒定，音程只在 25 半音窗口边缘折回处断裂一次。
     """
     med = statistics.median(pitches)
-    shift = int(round((NOTE_BASE_MIDI + NOTE_CENTER) - med))
+    bank = TRACK_BANKS.get(track)
+    center = (bank[2] + NOTE_CENTER) if bank else (NOTE_BASE_MIDI + NOTE_CENTER)
+    shift = int(round(center - med))
 
     def conv(p):
         q = int(p) + shift
-        bank = INSTRUMENT_BANKS[0] if q < 54 else (
-            INSTRUMENT_BANKS[2] if q > 78 else INSTRUMENT_BANKS[1])
-        inst, mat, base = bank
+        if bank:
+            b = bank
+        else:
+            b = INSTRUMENT_BANKS[0] if q < 54 else (
+                INSTRUMENT_BANKS[2] if q > 78 else INSTRUMENT_BANKS[1])
+        inst, mat, base = b
         n = q - base
         while n < 0:
             n += 12
@@ -126,7 +143,21 @@ def segment_delays(ticks):
     return ds
 
 
-def build(columns, resolution, col_notes, max_per_col, simple=False):
+TRACK_MATERIALS = {
+    'drums': 'minecraft:stone',
+    'bass': 'minecraft:bamboo_planks',
+    'other': 'minecraft:dirt',
+    'vocals': 'minecraft:dirt',
+}
+TRACK_INSTRUMENTS = {
+    'drums': 'basedrum',
+    'bass': 'bass',
+    'other': 'harp',
+    'vocals': 'harp',
+}
+
+
+def build(columns, resolution, col_notes, max_per_col, simple=False, track=None):
     """二维蛇形（层内多条带）构造。
 
     单条带 Z 结构（pitch = SLOT0 + MAX_SLOT + 1，MAX_SLOT 按本曲实际最大同列音符数收缩）：
@@ -291,9 +322,11 @@ def build(columns, resolution, col_notes, max_per_col, simple=False):
             bus_dust[c].append((x, y, z))
             put(x + d, y, z, 'minecraft:repeater', make_rep(1, 'west' if d > 0 else 'east'))
             branch_reps[c].append((x + d, y, z))
-            put(x + 2 * d, y - 1, z, mat)                  # 垫块决定乐器（bass/harp/bell）
+            pad_material = TRACK_MATERIALS[track] if track else mat
+            note_instrument = TRACK_INSTRUMENTS[track] if track else inst
+            put(x + 2 * d, y - 1, z, pad_material)         # 多轨按 stem 固定材质；单轨保留音高分档
             put(x + 2 * d, y, z, 'minecraft:note_block',
-                {'instrument': inst, 'note': str(nv), 'powered': 'false'})
+                {'instrument': note_instrument, 'note': str(nv), 'powered': 'false'})
             note_blocks[c].append((x + 2 * d, y, z))
         col_layer[c] = y
 
@@ -700,6 +733,8 @@ def main():
     ap.add_argument('--sustain-interval', type=int, default=2, help='延音重复间隔（列，默认 2）')
     ap.add_argument('--layout', choices=('folded', 'simple'), default='folded',
                     help='folded=蛇形折叠紧凑版（默认）；simple=一条到底的直线版，便于玩家跟看')
+    ap.add_argument('--track', choices=tuple(TRACK_MATERIALS), default=None,
+                    help='多轨 stem 名称；指定后音符盒底部使用该音轨材质')
     args = ap.parse_args()
     simple = args.layout == 'simple'
 
@@ -707,10 +742,14 @@ def main():
     assert res in (2, 4, 6, 8), 'resolution 必须为 2/4/6/8 之一'
     col_seconds = res / MC_TICKS_PER_SEC
     columns = int(round(args.seconds / col_seconds))
-    total_ticks_expect = int(round(args.seconds * MC_TICKS_PER_SEC))
+    # 结构总刻数由列数×resolution 决定（列是刻的量化网格）；seconds 为小数时
+    # round(seconds×20) 与 columns×res 可能差 1 刻（如 8.15s → 82列=164 刻 ≠ round(163)），
+    # 故期望值必须从列数推导，否则真实时长（非整秒）必然触发"总时长检查失败"。
+    total_ticks_expect = columns * res
     print(f'输入: {args.input}')
     print(f'参数: seconds={args.seconds} resolution={res} → 列宽 {col_seconds:.3f}s, 共 {columns} 列'
           f'；布局 {"一条到底(直线)" if simple else "蛇形折叠"}'
+          f'；音轨 {args.track or "单轨音高分档"}'
           f'；延音 {"开(间隔 %d 列)" % args.sustain_interval if args.sustain else "关"}')
 
     # 1) 音符（保留结束时间）+ 量化 + 可选延音扩展
@@ -727,7 +766,7 @@ def main():
         notes_q.append((pitch, c0, D))
 
     # 2) 音高映射（乐器分档）+ 逐列汇总（延音扩展 + (乐器,note) 去重）
-    conv, med, shift = build_pitch_map([p for p, _, _ in all_notes])
+    conv, med, shift = build_pitch_map([p for p, _, _ in all_notes], args.track)
     col_key = defaultdict(set)                            # 每列已用 (乐器,垫块,note)
     placed_from = defaultdict(list)                       # (列, (乐器,垫块,note)) -> [(c0,D)...]
     sustain_added = 0
@@ -774,7 +813,7 @@ def main():
     # 3) 生成结构
     (blocks, tap_of_col, bus_dust, branch_reps, note_blocks, col_layer,
      zfolds, yfold_climbs, yfold_cells, layer_ys, window,
-     N_STRIP, PITCH, SLOT0, MAX_SLOT) = build(columns, res, col_notes, max_per_col, simple)
+     N_STRIP, PITCH, SLOT0, MAX_SLOT) = build(columns, res, col_notes, max_per_col, simple, args.track)
     if max_per_col > MAX_SLOT:
         raise SystemExit(f'错误：单列音符数 {max_per_col} 超过条带容量 {MAX_SLOT}（未截断）')
 

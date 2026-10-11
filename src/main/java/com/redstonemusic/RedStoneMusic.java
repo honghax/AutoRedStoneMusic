@@ -33,6 +33,9 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Locale;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Optional;
 
 @Mod(RedStoneMusic.MODID)
 public class RedStoneMusic {
@@ -64,25 +67,52 @@ public class RedStoneMusic {
                 .then(Commands.literal("list")
                     .then(Commands.literal("mp3").executes(context -> listFiles(context, "mp3")))
                     .then(Commands.literal("ntb").executes(context -> listFiles(context, "ntb"))))
-                .then(Commands.literal("Convert")
-                    .then(Commands.argument("file", StringArgumentType.greedyString())
-                        .executes(context -> convert(context, StringArgumentType.getString(context, "file"), true))))
+                .then(convertCommand("Convert"))
                 .then(Commands.literal("place")
                     .then(Commands.argument("file", StringArgumentType.word())
                         .executes(context -> placeExternal(context, StringArgumentType.getString(context, "file")))))
+                .then(Commands.literal("debug")
+                    .then(Commands.literal("place")
+                        .then(Commands.argument("structure", StringArgumentType.word())
+                            .executes(context -> placeBuiltin(context, StringArgumentType.getString(context, "structure"))))))
         );
         event.getDispatcher().register(
             Commands.literal("redstonemusic").requires(source -> source.hasPermission(2))
                 .then(Commands.literal("list")
                     .then(Commands.literal("mp3").executes(context -> listFiles(context, "mp3")))
                     .then(Commands.literal("ntb").executes(context -> listFiles(context, "ntb"))))
-                .then(Commands.literal("convert")
-                    .then(Commands.argument("file", StringArgumentType.greedyString())
-                        .executes(context -> convert(context, StringArgumentType.getString(context, "file"), true))))
+                .then(convertCommand("convert"))
                 .then(Commands.literal("place")
                     .then(Commands.argument("file", StringArgumentType.word())
                         .executes(context -> placeExternal(context, StringArgumentType.getString(context, "file")))))
+                .then(Commands.literal("debug")
+                    .then(Commands.literal("place")
+                        .then(Commands.argument("structure", StringArgumentType.word())
+                            .executes(context -> placeBuiltin(context, StringArgumentType.getString(context, "structure"))))))
         );
+    }
+
+    // Convert <file> [ai|trad] [true|false] [to ntb] —— 引擎与多轨开关是命令语法节点，不是字符串参数
+    private static com.mojang.brigadier.builder.LiteralArgumentBuilder<CommandSourceStack> convertCommand(String literal) {
+        return Commands.literal(literal)
+            .then(Commands.argument("file", StringArgumentType.word())
+                .executes(context -> convert(context, getFile(context), "ai", false, true))
+                .then(Commands.literal("to")
+                    .then(Commands.literal("ntb").executes(context -> convert(context, getFile(context), "ai", false, false))))
+                .then(Commands.literal("true").executes(context -> convert(context, getFile(context), "ai", true, true)))
+                .then(Commands.literal("false").executes(context -> convert(context, getFile(context), "ai", false, true)))
+                .then(Commands.literal("ai")
+                    .executes(context -> convert(context, getFile(context), "ai", false, true))
+                    .then(Commands.literal("true").executes(context -> convert(context, getFile(context), "ai", true, true)))
+                    .then(Commands.literal("false").executes(context -> convert(context, getFile(context), "ai", false, true))))
+                .then(Commands.literal("trad")
+                    .executes(context -> convert(context, getFile(context), "trad", false, true))
+                    .then(Commands.literal("true").executes(context -> convert(context, getFile(context), "trad", true, true)))
+                    .then(Commands.literal("false").executes(context -> convert(context, getFile(context), "trad", false, true)))));
+    }
+
+    private static String getFile(CommandContext<CommandSourceStack> context) {
+        return StringArgumentType.getString(context, "file");
     }
 
     private static int listFiles(CommandContext<CommandSourceStack> context, String type) {
@@ -102,21 +132,19 @@ public class RedStoneMusic {
         }
     }
 
-    private static int convert(CommandContext<CommandSourceStack> context, String raw, boolean placeAfter) {
+    private static int convert(CommandContext<CommandSourceStack> context, String file,
+                               String engine, boolean separate, boolean shouldPlace) {
         if (!ready(context)) return 0;
-        String parsedFile = raw.trim();
-        boolean shouldPlace = placeAfter;
-        if (parsedFile.toLowerCase(Locale.ROOT).endsWith(" to ntb")) {
-            parsedFile = parsedFile.substring(0, parsedFile.length() - 6).trim();
-            shouldPlace = false;
-        }
-        final String file = parsedFile;
-        final boolean finalShouldPlace = shouldPlace;
         try {
             Path input = storage.resolveMp3(file);
             if (!Files.isRegularFile(input)) throw new IOException("mp3 文件不存在: " + file);
-            String outputName = stripExtension(input.getFileName().toString()) + ".ntb";
-            Path output = storage.ntbDirectory().resolve(outputName);
+            String base = stripExtension(input.getFileName().toString());
+            if (separate) {
+                // 多音轨：文件名带 <engine>_true 签名
+                Path output = storage.ntbDirectory().resolve(base + "_" + engine + "_true.ntb");
+                return multiConvert(context, input, output, engine, shouldPlace);
+            }
+            Path output = storage.ntbDirectory().resolve(base + "_" + engine + "_false.ntb");
             LOGGER.info("CONVERT 开始: {} -> {}", input, output);
             context.getSource().sendSuccess(() -> Component.literal("开始转换: " + file), false);
             Path finalInput = input;
@@ -136,7 +164,7 @@ public class RedStoneMusic {
                     }
                     LOGGER.info("CONVERT 完成: {}", result);
                     context.getSource().sendSuccess(() -> Component.literal("转换完成: " + result.getFileName()), false);
-                    if (finalShouldPlace) {
+                    if (shouldPlace) {
                         context.getSource().sendSuccess(() -> Component.literal("正在放置结构..."), false);
                         placeFile(context, result);
                     }
@@ -148,12 +176,69 @@ public class RedStoneMusic {
         }
     }
 
+    private static int multiConvert(CommandContext<CommandSourceStack> context, Path input,
+                                    Path output, String engine, boolean placeAfter) {
+        try {
+            String engineLabel = "trad".equalsIgnoreCase(engine) ? "传统算法" : "AI(demucs)";
+            context.getSource().sendSuccess(() -> Component.literal("开始" + engineLabel + "多音轨转换: " + input.getFileName()), false);
+            toolRunner.convertMultiAsync(input, output, engine, 0.015).whenComplete((result, error) -> {
+                try {
+                    ServerPlayer player = context.getSource().getPlayerOrException();
+                    player.server.execute(() -> {
+                        if (error != null) {
+                            LOGGER.error("多音轨转换失败: {}", input, error);
+                            context.getSource().sendFailure(Component.literal("多音轨转换失败: " + rootMessage(error)));
+                            return;
+                        }
+                        try {
+                            context.getSource().sendSuccess(() -> Component.literal("多音轨转换完成: " + result.getFileName()), false);
+                            if (placeAfter) {
+                                placeFile(context, result);
+                            }
+                        } catch (Exception e) {
+                            fail(context, "多音轨放置失败: " + e.getMessage(), e);
+                        }
+                    });
+                } catch (Exception e) {
+                    LOGGER.error("多音轨完成后找不到玩家", e);
+                }
+            });
+            return 1;
+        } catch (Exception e) {
+            return fail(context, "多音轨转换失败: " + e.getMessage(), e);
+        }
+    }
+
     private static int placeExternal(CommandContext<CommandSourceStack> context, String file) {
         if (!ready(context)) return 0;
         try {
             Path path = storage.resolveNtb(file);
             if (!Files.isRegularFile(path)) throw new IOException("ntb 文件不存在: " + file);
             return placeFile(context, path);
+        } catch (Exception e) {
+            return fail(context, "放置失败: " + e.getMessage(), e);
+        }
+    }
+
+    // 内部调试：放置模组自带的结构资源 data/redstone_music/structures/<name>.nbt
+    private static int placeBuiltin(CommandContext<CommandSourceStack> context, String name) {
+        try {
+            String id = name.toLowerCase(Locale.ROOT);
+            if (!id.matches("[a-z0-9_.-]+")) throw new IOException("非法结构名: " + name);
+            ServerLevel level = context.getSource().getLevel();
+            ResourceLocation loc = new ResourceLocation(MODID, id);
+            Optional<StructureTemplate> template = level.getStructureManager().get(loc);
+            if (template.isEmpty()) throw new IOException("结构资源不存在: " + loc);
+            ServerPlayer player = context.getSource().getPlayerOrException();
+            Vec3 look = player.getLookAngle();
+            BlockPos origin = BlockPos.containing(player.getX() + look.x * 4.0D, player.getY(), player.getZ() + look.z * 4.0D);
+            Vec3i size = template.get().getSize();
+            if (size.getX() < 1 || size.getY() < 1 || size.getZ() < 1) throw new IOException("结构尺寸无效");
+            boolean ok = template.get().placeInWorld(level, origin, origin, new StructurePlaceSettings(), level.random, Block.UPDATE_ALL);
+            if (!ok) throw new IOException("StructureTemplate 放置失败");
+            LOGGER.info("DEBUG PLACE: {} origin={} size={}x{}x{}", loc, origin, size.getX(), size.getY(), size.getZ());
+            context.getSource().sendSuccess(() -> Component.literal("已放置内置结构 " + loc + "，尺寸 " + size.getX() + "x" + size.getY() + "x" + size.getZ()), true);
+            return 1;
         } catch (Exception e) {
             return fail(context, "放置失败: " + e.getMessage(), e);
         }
