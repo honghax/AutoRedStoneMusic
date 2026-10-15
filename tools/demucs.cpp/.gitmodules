@@ -1,0 +1,13 @@
+[submodule "vendor/eigen"]
+	path = vendor/eigen
+	url = https://gitlab.com/libeigen/eigen.git
+[submodule "vendor/demucs"]
+	path = vendor/demucs
+	url = https://github.com/sevagh/demucs
+	branch = release_v4
+[submodule "vendor/libnyquist"]
+	path = vendor/libnyquist
+	url = https://github.com/ddiakopoulos/libnyquist
+[submodule "vendor/googletest"]
+	path = vendor/googletest
+	url = https://github.com/google/googletest
