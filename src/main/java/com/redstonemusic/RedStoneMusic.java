@@ -144,18 +144,19 @@ public class RedStoneMusic {
             .then(Commands.literal("pitch")
                 .executes(context -> convert(context, getFile(context), engine, separate, place,
                     lanes(context), "pitch", DEFAULT_POLY))
-                .then(polyArg(engine, separate, place, "pitch")))
+                .then(polyUnderSplit(engine, separate, place, "pitch")))
             .then(Commands.literal("bank")
                 .executes(context -> convert(context, getFile(context), engine, separate, place,
                     lanes(context), "bank", DEFAULT_POLY))
-                .then(polyArg(engine, separate, place, "bank")));
+                .then(polyUnderSplit(engine, separate, place, "bank")));
     }
 
-    private static com.mojang.brigadier.builder.RequiredArgumentBuilder<CommandSourceStack, Integer> polyArg(
+    private static com.mojang.brigadier.builder.LiteralArgumentBuilder<CommandSourceStack> polyUnderSplit(
             String engine, boolean separate, boolean place, String split) {
-        return Commands.argument("poly", IntegerArgumentType.integer(1, 128))
-            .executes(context -> convert(context, getFile(context), engine, separate, place,
-                lanes(context), split, poly(context)));
+        return Commands.literal("poly")
+            .then(Commands.argument("poly", IntegerArgumentType.integer(1, 128))
+                .executes(context -> convert(context, getFile(context), engine, separate, place,
+                    lanes(context), split, poly(context))));
     }
 
     private static com.mojang.brigadier.builder.LiteralArgumentBuilder<CommandSourceStack> polyNode(
