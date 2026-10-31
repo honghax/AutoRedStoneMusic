@@ -26,7 +26,7 @@
       不足时补 z=0 红石粉(0 延迟)。
     · 脉冲源：lever → 正对的 observer(facing=west)，输出在其反面 east = 列0 抽头 (-2,1,0)。
     · 末端指示灯：最后一个抽头后再加 1 级 delay=1 中继器，正面接 redstone_lamp（诊断脉冲是否走完）。
-    · 支撑层：每个工作层下方铺 dirt（折返处的 glowstone 不被覆盖），并作音符盒的垫块/材质；
+    · 支撑层：每个工作层下方铺平滑石英（折返处的 glowstone 不被覆盖），并作音符盒的垫块/材质；
       其中真正决定乐器的是音符盒正下方那格：dirt→harp、bamboo_planks→bass、gold_block→bell，
       借此把音域从 harp 的 F#3~F#5 扩到 F#1~F#7（见 INSTRUMENT_BANKS）。
     · 红石粉对音符盒无效（已实测），必须靠支线中继器正向强充能。
@@ -157,8 +157,13 @@ TRACK_INSTRUMENTS = {
 }
 
 
-def build(columns, resolution, col_notes, max_per_col, simple=False, track=None):
+def build(columns, resolution, col_notes, max_per_col, simple=False, track=None,
+          timeline=None):
     """二维蛇形（层内多条带）构造。
+
+    timeline：可选的「时间轴列集合」。给定时主干按这些列推进（保证多条平行轨道
+    共享同一条 X 骨架、脉冲前后对齐），但只在这些列与 col_notes 有交集时放置
+    音符/支线；空列只推进主干，不产生总线/跨接粉。默认 None = 旧行为。
 
     单条带 Z 结构（pitch = SLOT0 + MAX_SLOT + 1，MAX_SLOT 按本曲实际最大同列音符数收缩）：
     base+0 主干行 / +1 跨接行 / +2..+1+MAX_SLOT 音符槽 / 末格条带间隔。
@@ -338,8 +343,9 @@ def build(columns, resolution, col_notes, max_per_col, simple=False, track=None)
     col_layer[0] = 1
 
     # ---- 主干走线 + 逐列 ----
+    timeline_cols = sorted(timeline) if timeline is not None else sorted(col_notes)
     prev = 0
-    for c in sorted(col_notes):
+    for c in timeline_cols:
         gap = resolution * (c - prev)
         ds = segment_delays(gap)
         reps = Z_FOLD_REPS
@@ -371,7 +377,8 @@ def build(columns, resolution, col_notes, max_per_col, simple=False, track=None)
             while not (X_MIN <= st['x'] <= X_MAX):
                 step_dust()
         tap_of_col[c] = (st['x'], st['y'], st['base_z'])
-        column_at(c, st['x'], st['y'], st['base_z'], st['dir'])
+        if c in col_notes:
+            column_at(c, st['x'], st['y'], st['base_z'], st['dir'])
         prev = c
 
     # ---- 末端指示灯 ----
@@ -381,10 +388,10 @@ def build(columns, resolution, col_notes, max_per_col, simple=False, track=None)
     st['x'] += st['dir']
     put(st['x'], st['y'], st['base_z'], 'minecraft:redstone_lamp', {'lit': 'false'})
 
-    # ---- 支撑层：工作层下方铺 dirt（折返处 glowstone 已显式放置，不被覆盖） ----
+    # ---- 支撑层：工作层下方铺平滑石英（音符盒垫块已显式放置，不被覆盖） ----
     for (x, y, z) in list(blocks.keys()):
         if y in layer_ys:
-            blocks.setdefault((x, y - 1, z), ('minecraft:dirt', {}))
+            blocks.setdefault((x, y - 1, z), ('minecraft:smooth_quartz', {}))
 
     # ---- 红石粉连接状态（视觉；放置后 MC 重算） ----
     for pos, (name, props) in list(blocks.items()):
@@ -547,9 +554,9 @@ def validate(resolution, blocks, dist, tap_of_col, bus_dust, branch_reps, note_b
     # (3) 条带间隔（z % PITCH == PITCH-1）除折返走廊外必须为空
     out['strip_gap_cells'] = [p for p in blocks if p[2] % PITCH == PITCH - 1]
     out['strip_gap_bad'] = [p for p in out['strip_gap_cells']
-                            if p not in zfold_cells and blocks[p][0] != 'minecraft:dirt']
-    out['strip_gap_dirt'] = [p for p in out['strip_gap_cells']
-                             if p not in zfold_cells and blocks[p][0] == 'minecraft:dirt']
+                            if p not in zfold_cells and blocks[p][0] != 'minecraft:smooth_quartz']
+    out['strip_gap_quartz'] = [p for p in out['strip_gap_cells']
+                               if p not in zfold_cells and blocks[p][0] == 'minecraft:smooth_quartz']
 
     # (4) 跨层相邻违规（不同工作层，折返格除外）；隔层非折返方块
     out['cross_adj'] = []

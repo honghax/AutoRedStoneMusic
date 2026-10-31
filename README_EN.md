@@ -4,6 +4,8 @@ A Forge mod and local toolchain that converts ordinary audio into playable Minec
 
 AutoRedStoneMusic takes an MP3 or WAV file and turns it into a Minecraft Structure NBT file containing note blocks and redstone timing. The generated structure can be saved, shared, loaded again, and placed directly in front of the player from inside Minecraft.
 
+> **Update (2026-10-31)**: Added **multi-lane straight structures** — at the "final MIDI → NBT" stage, notes are split into 1–3 parallel redstone lanes. All lanes share one timeline skeleton and one lever-driven start bus, so their pulses march in sync. `Convert` gained `lanes <N>`, `split pitch|bank`, and `poly 1..128`; omitting `lanes` keeps the original single-track NBT path. All structural support blocks now use **smooth quartz** (instrument pads directly under note blocks are preserved). Added standalone tools `arrange_multilane.py`, `arrange_straight.py`, `eval_ntb_loss.py`, and two debug structures.
+
 > **Update (2026-10-11)**: Added **source-separation multi-track conversion** with two engines — AI (Demucs) and a traditional algorithm (C++ REPET/HPSS). It supports discarding weak stems via an energy threshold, transcribing each stem to MIDI and merging them, then reusing the original three-bank pitch expansion to produce a single structure. Also fixed the non-integer duration assertion, 24-bit WAV reading, and a write-out scaling bug that lowered reconstruction fidelity.
 
 ## What It Does
@@ -25,6 +27,9 @@ AutoRedStoneMusic takes an MP3 or WAV file and turns it into a Minecraft Structu
 - **New: energy-threshold stem dropping** — automatically discards low-energy stems by energy ratio (default 1.5%) so noise stems do not pollute the result.
 - **New: multi-MIDI merging** — transcribes each stem to MIDI and merges them into a single MIDI, then reuses the three-bank pitch expansion (high bell / mid harp / low bass) to produce one structure.
 - **New: built-in structure debug placement** — `debug place <structure>` places a mod-bundled structure directly, for auditioning and internal debugging.
+- **New: optional multi-lane straight structures** — at the "final MIDI → NBT" stage, notes are split by pitch/timbre into 1–3 parallel lanes. Each lane has its own redstone skeleton; all lanes share one timeline column set and one lever-driven start bus, so pulses advance in sync.
+- **New: `lanes` / `split` / `poly` command parameters** — the default remains the original single-track NBT. `lanes` enables multi-lane output, `split` selects pitch-balanced or timbre-bank assignment, and `poly` caps per-lane same-column polyphony (1–128, default 20).
+- **New: unified building material** — all structural support/strip-gap blocks now use `minecraft:smooth_quartz`; only the instrument pads directly under note blocks (`dirt` / `bamboo_planks` / `gold_block`) and the functionally required `glowstone` in folded layouts are preserved.
 
 ## Pipeline
 
@@ -80,6 +85,27 @@ merge_midis.exe merges into a single MIDI
 midi_to_nbt.exe single-bank three-tier mapping → Minecraft Structure NBT
 ```
 
+Multi-lane structure (optional, added 2026-10-31):
+
+```text
+Final MIDI (single-track transcription, or the merged MIDI after separation)
+   |
+   v
+arrange_multilane.exe
+   ├─ split pitch: balance lanes by sorted pitch
+   ├─ split bank : assign lanes by bass / harp / bell timbre
+   └─ poly <N>   : cap per-lane same-column polyphony (keep highest pitches)
+   |
+   v
+N parallel straight redstone lanes (each with its own repeaters, branches, note blocks)
+   |
+   v
+Shared start bus (one lever + observer + 0-delay redstone dust)
+   |
+   v
+Minecraft Structure NBT
+```
+
 The project is split into the following independent Windows tools:
 
 1. `audio_to_midi.exe`
@@ -105,11 +131,18 @@ The project is split into the following independent Windows tools:
 5. `merge_midis.exe` (new)
    - Merges multiple stem MIDIs into one MIDI (each source is assigned its own channel to avoid same-pitch cross-track overwrite and head-to-tail pairing errors).
 
+6. `arrange_multilane.exe` (new)
+   - Optional multi-lane structure generator: reads the final MIDI, splits notes by `split`, caps same-column polyphony by `poly`, and emits N parallel straight lanes.
+   - All lanes share one timeline skeleton, so notes in the same column align in X; a single 0-delay start bus drives every lane, so one lever starts them together.
+   - Disabled by default; it replaces `midi_to_nbt.exe` only when the command includes `lanes`.
+
 The mod calls these executables with `ProcessBuilder`, without JNI. Audio inference, source separation, and NBT generation are therefore decoupled from the Minecraft JVM, making the pipeline easier to test, replace, and extend.
 
 ## In-Game Directories
 
-> **Update**: The runtime tools directory gained the multi-track executables and Demucs model weights.
+> **Update (2026-10-31)**: The runtime tools directory gained `arrange_multilane.exe` (multi-lane structure generator).
+>
+> **Update (2026-10-11)**: The runtime tools directory gained the multi-track executables and Demucs model weights.
 
 After the first launch, the mod creates:
 
@@ -132,14 +165,17 @@ redstonemusic/tools/
 ├── demucs_mt.cpp.main.exe
 ├── ggml-model-htdemucs-4s-f16.bin
 ├── traditional_sep.exe
-└── merge_midis.exe
+├── merge_midis.exe
+└── arrange_multilane.exe
 ```
 
 This `redstonemusic/tools/` path is created inside the temporary runtime workspace. Users do not need to create it manually.
 
 ## In-Game Commands
 
-> **Update**: `Convert` gained engine and multi-track syntax nodes (`ai`/`trad`, `true`/`false`); `true`/`false` are command-syntax nodes rather than string arguments. A new `debug place <structure>` was added, and generated file names now carry engine and multi-track signatures.
+> **Update (2026-10-31)**: `Convert` gained `lanes <N>`, `split pitch|bank`, and `poly 1..128` syntax nodes; omitting `lanes` keeps the original single-track NBT path. Generated file names add `_L<N>[_bank][_P<cap>]`.
+>
+> **Update (2026-10-11)**: `Convert` gained engine and multi-track syntax nodes (`ai`/`trad`, `true`/`false`); `true`/`false` are command-syntax nodes rather than string arguments. A new `debug place <structure>` was added, and generated file names now carry engine and multi-track signatures.
 
 The commands require permission level 2. Lowercase compatibility commands are also registered.
 
@@ -153,6 +189,12 @@ The commands require permission level 2. Lowercase compatibility commands are al
 /RedStoneMusic Convert song.mp3 ai true
 /RedStoneMusic Convert song.mp3 trad true
 /RedStoneMusic Convert song.mp3 trad false
+/RedStoneMusic Convert song.mp3 lanes 3
+/RedStoneMusic Convert song.mp3 lanes 3 poly 8
+/RedStoneMusic Convert song.mp3 lanes 3 split bank
+/RedStoneMusic Convert song.mp3 lanes 3 split bank poly 8
+/RedStoneMusic Convert song.mp3 true lanes 3 poly 8
+/RedStoneMusic Convert song.mp3 trad true lanes 3 split bank poly 12
 /RedStoneMusic place song.ntb
 /RedStoneMusic debug place <structure>
 ```
@@ -170,25 +212,45 @@ Commands:
 - `Convert song.mp3 trad false`: Explicitly selects the traditional engine without multi-track separation.
 - `place song.ntb`: Loads and places an existing structure.
 - `debug place <structure>`: Places a mod-bundled structure resource (`data/redstone_music/structures/<structure>.nbt`) without needing a file in the `ntb` directory, for internal auditioning.
+- `Convert song.mp3 lanes 3`: Builds **3 parallel straight lanes** from the final MIDI (default `split=pitch`, `poly=20`).
+- `Convert song.mp3 lanes 3 poly 8`: Keeps at most 8 notes per lane per column, dropping the lowest pitches; `poly` ranges 1–128.
+- `Convert song.mp3 lanes 3 split bank`: Assigns lanes by `bass / harp / bell` timbre instead of pitch-balanced splitting.
+- `Convert song.mp3 true lanes 3 ...`: Runs AI separation first, then builds 3 lanes from the merged final MIDI.
+- `Convert song.mp3 trad true lanes 3 ...`: Traditional separation plus 3 lanes.
 
-Generated file names follow `<name>_<engine>_<multi-track>.ntb`, e.g. `a_ai_false.ntb` for a single-track AI conversion or `a_trad_true.ntb` for a traditional multi-track conversion. Only a single file name inside the configured directory is accepted. The mod validates extensions and rejects path traversal attempts.
+Generated file names follow `<name>_<engine>_<multi-track>[_L<N>][_bank][_P<cap>].ntb`, e.g. `a_ai_false.ntb` for a single-track AI conversion, `a_trad_true.ntb` for a traditional multi-track conversion, `a_ai_false_L3.ntb` for 3 lanes with pitch/poly20, or `a_ai_false_L3_bank_P8.ntb` for 3 lanes with bank/poly8. Only a single file name inside the configured directory is accepted. The mod validates extensions and rejects path traversal attempts.
 
 ## Test Results
 
-> **Update**: Added multi-track structure tests (AI / traditional separation → energy threshold → per-stem MIDI → merge → single-bank three-tier) and a fidelity check for C++ traditional separation — recombining the separated stems reproduces the source audio with a correlation around 0.98, confirming the separation and write-out stages preserve fidelity.
+> **Update (2026-10-31)**: Added a Canon (instrumental) 30-second single-track vs traditional-separation comparison and a 3-lane straight-structure measurement; added MIDI/NBT loss quantification tools and results. Structural support material is now smooth quartz.
+>
+> **Update (2026-10-11)**: Added multi-track structure tests (AI / traditional separation → energy threshold → per-stem MIDI → merge → single-bank three-tier) and a fidelity check for C++ traditional separation — recombining the separated stems reproduces the source audio with a correlation around 0.98, confirming the separation and write-out stages preserve fidelity.
 
-The test videos show the converted songs and the resulting Minecraft redstone music. Video playback duration is not conversion time. The conversion time below means the complete pipeline from input audio through decoding, ONNX inference, MIDI writing, NBT generation, and final output completion.
+The conversion time below means the complete pipeline from input audio through decoding, ONNX inference, MIDI writing, NBT generation, and final output completion.
 
-| Test song | Full conversion time | Test coverage | Video |
-| --- | ---: | --- | --- |
-| Senbonzakura | About 34 seconds | MP4 audio extracted, then MP3/WAV → MIDI → NBT, followed by in-game redstone structure playback | [Watch test video](./千本樱.mp4) |
-| March of the Volunteers | About 4 seconds | MP4 audio extracted, then MP3/WAV → MIDI → NBT, followed by in-game redstone structure playback | [Watch test video](./义勇军进行曲.mp4) |
+| Test song | Full conversion time | Test coverage |
+| --- | ---: | --- |
+| Senbonzakura | About 34 seconds | MP4 audio extracted, then MP3/WAV → MIDI → NBT, followed by in-game redstone structure playback |
+| March of the Volunteers | About 4 seconds | MP4 audio extracted, then MP3/WAV → MIDI → NBT, followed by in-game redstone structure playback |
 
 Additional multi-track verification:
 
 - Traditional C++ separation on a single track (~56s of material) took about 4.6 seconds in the separation stage, notably faster than the equivalent pure-Python implementation.
 - Recombining the separated stems reproduces the source audio with a correlation around 0.98 and a normalized residual around 0.03, indicating the separation and write-out stages introduce no audible distortion.
 - Generated test structures: `merged.nbt` (AI multi-track), `trad_merged.nbt` (traditional multi-track), `ap4_merged.nbt`.
+
+Canon 30s / multi-lane verification (2026-10-31):
+
+| Metric | Single-track | Traditional separation |
+| --- | ---: | ---: |
+| Notes | 187 | 589 |
+| Global chroma cosine | 0.9297 | 0.9310 |
+| Harmonic coverage | 56.6% | 63.3% |
+| Per-note pitch-class top1 / top3 | 54.5% / 89.8% | 49.7% / 82.0% |
+
+- 3-lane straight structure (`split=pitch`, `poly=6`): 197 / 196 / 196 notes, size 699×2×27, 445 note blocks, shared start bus max distance 10 blocks; self-check found 0 unreachable note blocks and 0 note-block/dust adjacency.
+- Smooth-quartz check: 3324 `smooth_quartz` support blocks, only 320 `dirt` blocks and all directly under note blocks; bass/bell pads (`bamboo_planks` / `gold_block`) are unchanged.
+- Debug structures: `canon_roles_straight.nbt` (role-split single-track) and `canon_multilane.nbt` (3 lanes).
 
 The tests cover:
 
@@ -275,6 +337,9 @@ python -m PyInstaller --clean --noconfirm `
 
 python -m PyInstaller --clean --noconfirm `
   tools\some-onnx\packaging\midi_to_nbt.spec
+
+python -m PyInstaller --clean --noconfirm `
+  tools\some-onnx\packaging\arrange_multilane.spec
 ```
 
 ### Build the Forge Mod
@@ -287,17 +352,24 @@ The final mod JAR is written to `build/libs/`. Runtime tools are packaged under 
 
 ## Project Layout
 
-> **Update**: Added `cpp/traditional_sep/` (C++ traditional separation), `cpp/eigen/` (Eigen headers), `src/merge_midis.py` (MIDI merge), `src/traditional_separate.py` (Python reference implementation), and `MultiTrackNbtMerger.java`.
+> **Update (2026-10-31)**: Added `src/arrange_multilane.py` (final MIDI → multi-lane straight), `src/arrange_straight.py` (multi-role → single straight), `src/eval_ntb_loss.py` (loss quantification), `packaging/arrange_multilane.spec`, and debug structures `canon_roles_straight.nbt` / `canon_multilane.nbt`.
+>
+> **Update (2026-10-11)**: Added `cpp/traditional_sep/` (C++ traditional separation), `cpp/eigen/` (Eigen headers), `src/merge_midis.py` (MIDI merge), `src/traditional_separate.py` (Python reference implementation), and `MultiTrackNbtMerger.java`.
 
 ```text
 src/main/java/com/redstonemusic/   Forge mod and command implementation
 src/main/resources/                Mod metadata and runtime resources
-tools/some-onnx/cpp/               C++ inference source and build scripts
-tools/some-onnx/cpp/traditional_sep/   C++ traditional source separation
-tools/some-onnx/cpp/eigen/         Header-only Eigen library
-tools/some-onnx/src/               MIDI, NBT, and Python helper source
-tools/some-onnx/packaging/         PyInstaller specifications
-tools/some-onnx/runtime/           EXE, DLL, FFmpeg, and model files
+ tools/some-onnx/cpp/               C++ inference source and build scripts
+ tools/some-onnx/cpp/traditional_sep/   C++ traditional source separation
+ tools/some-onnx/cpp/eigen/         Header-only Eigen library
+ tools/some-onnx/src/               MIDI, NBT, and Python helper source
+ tools/some-onnx/src/arrange_multilane.py   Final MIDI → multi-lane straight structure
+ tools/some-onnx/src/arrange_straight.py    Multi-role MIDI → single straight structure
+ tools/some-onnx/src/eval_ntb_loss.py       MIDI/NBT loss quantification
+ tools/some-onnx/packaging/         PyInstaller specifications
+ tools/some-onnx/packaging/arrange_multilane.spec   Multi-lane tool packaging spec
+ tools/some-onnx/runtime/           EXE, DLL, FFmpeg, and model files
+ src/main/resources/data/redstone_music/structures/   Built-in debug structures (incl. canon_*.nbt)
 ```
 
 ## Security Notes for Server Administrators
@@ -308,7 +380,7 @@ This mod starts native programs on the server host. A Forge JAR should not be as
 
 ### Why executables and DLLs are extracted
 
-The JAR bundles fixed versions of `audio_to_midi.exe`, `midi_to_nbt.exe`, `demucs_mt.cpp.main.exe`, `traditional_sep.exe`, `merge_midis.exe`, the Demucs model weights, FFmpeg, ONNX Runtime DLLs, and the `nmp.onnx` weights. During initialization, the mod copies these resources into a newly created `RedStoneMusic-*` working directory under the system temporary directory. Windows tools and DLLs need ordinary filesystem paths for execution and loading. These files are bundled resources, not downloaded from the network or extracted from song input. The mod launches the specified executables with `ProcessBuilder` argument lists rather than building a shell command string.
+The JAR bundles fixed versions of `audio_to_midi.exe`, `midi_to_nbt.exe`, `arrange_multilane.exe`, `demucs_mt.cpp.main.exe`, `traditional_sep.exe`, `merge_midis.exe`, the Demucs model weights, FFmpeg, ONNX Runtime DLLs, and the `nmp.onnx` weights. During initialization, the mod copies these resources into a newly created `RedStoneMusic-*` working directory under the system temporary directory. Windows tools and DLLs need ordinary filesystem paths for execution and loading. These files are bundled resources, not downloaded from the network or extracted from song input. The mod launches the specified executables with `ProcessBuilder` argument lists rather than building a shell command string.
 
 ### File access and cleanup scope
 

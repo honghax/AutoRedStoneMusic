@@ -1,6 +1,7 @@
 package com.redstonemusic;
 
 import com.mojang.logging.LogUtils;
+import com.mojang.brigadier.arguments.IntegerArgumentType;
 import com.mojang.brigadier.arguments.StringArgumentType;
 import com.mojang.brigadier.context.CommandContext;
 import net.minecraft.commands.CommandSourceStack;
@@ -97,18 +98,88 @@ public class RedStoneMusic {
         return Commands.literal(literal)
             .then(Commands.argument("file", StringArgumentType.word())
                 .executes(context -> convert(context, getFile(context), "ai", false, true))
+                .then(lanesNode("ai", false, true))
                 .then(Commands.literal("to")
                     .then(Commands.literal("ntb").executes(context -> convert(context, getFile(context), "ai", false, false))))
-                .then(Commands.literal("true").executes(context -> convert(context, getFile(context), "ai", true, true)))
-                .then(Commands.literal("false").executes(context -> convert(context, getFile(context), "ai", false, true)))
+                .then(Commands.literal("true")
+                    .executes(context -> convert(context, getFile(context), "ai", true, true))
+                    .then(lanesNode("ai", true, true)))
+                .then(Commands.literal("false")
+                    .executes(context -> convert(context, getFile(context), "ai", false, true))
+                    .then(lanesNode("ai", false, true)))
                 .then(Commands.literal("ai")
                     .executes(context -> convert(context, getFile(context), "ai", false, true))
-                    .then(Commands.literal("true").executes(context -> convert(context, getFile(context), "ai", true, true)))
-                    .then(Commands.literal("false").executes(context -> convert(context, getFile(context), "ai", false, true))))
+                    .then(Commands.literal("true")
+                        .executes(context -> convert(context, getFile(context), "ai", true, true))
+                        .then(lanesNode("ai", true, true)))
+                    .then(Commands.literal("false")
+                        .executes(context -> convert(context, getFile(context), "ai", false, true))
+                        .then(lanesNode("ai", false, true))))
                 .then(Commands.literal("trad")
                     .executes(context -> convert(context, getFile(context), "trad", false, true))
-                    .then(Commands.literal("true").executes(context -> convert(context, getFile(context), "trad", true, true)))
-                    .then(Commands.literal("false").executes(context -> convert(context, getFile(context), "trad", false, true)))));
+                    .then(Commands.literal("true")
+                        .executes(context -> convert(context, getFile(context), "trad", true, true))
+                        .then(lanesNode("trad", true, true)))
+                    .then(Commands.literal("false")
+                        .executes(context -> convert(context, getFile(context), "trad", false, true))
+                        .then(lanesNode("trad", false, true)))));
+    }
+
+    // lanes <N> [split pitch|bank] [poly 1..128]：最终 MIDI → N 轨直排结构
+    private static final int DEFAULT_POLY = 20;
+
+    private static com.mojang.brigadier.builder.LiteralArgumentBuilder<CommandSourceStack> lanesNode(
+            String engine, boolean separate, boolean place) {
+        return Commands.literal("lanes")
+            .then(Commands.argument("lanes", IntegerArgumentType.integer(1, 3))
+                .executes(context -> convert(context, getFile(context), engine, separate, place,
+                    lanes(context), "pitch", DEFAULT_POLY))
+                .then(splitNode(engine, separate, place))
+                .then(polyNode(engine, separate, place)));
+    }
+
+    private static com.mojang.brigadier.builder.LiteralArgumentBuilder<CommandSourceStack> splitNode(
+            String engine, boolean separate, boolean place) {
+        return Commands.literal("split")
+            .then(Commands.literal("pitch")
+                .executes(context -> convert(context, getFile(context), engine, separate, place,
+                    lanes(context), "pitch", DEFAULT_POLY))
+                .then(polyArg(engine, separate, place, "pitch")))
+            .then(Commands.literal("bank")
+                .executes(context -> convert(context, getFile(context), engine, separate, place,
+                    lanes(context), "bank", DEFAULT_POLY))
+                .then(polyArg(engine, separate, place, "bank")));
+    }
+
+    private static com.mojang.brigadier.builder.RequiredArgumentBuilder<CommandSourceStack, Integer> polyArg(
+            String engine, boolean separate, boolean place, String split) {
+        return Commands.argument("poly", IntegerArgumentType.integer(1, 128))
+            .executes(context -> convert(context, getFile(context), engine, separate, place,
+                lanes(context), split, poly(context)));
+    }
+
+    private static com.mojang.brigadier.builder.LiteralArgumentBuilder<CommandSourceStack> polyNode(
+            String engine, boolean separate, boolean place) {
+        var pitch = Commands.literal("pitch")
+            .executes(context -> convert(context, getFile(context), engine, separate, place,
+                lanes(context), "pitch", poly(context)));
+        var bank = Commands.literal("bank")
+            .executes(context -> convert(context, getFile(context), engine, separate, place,
+                lanes(context), "bank", poly(context)));
+        var split = Commands.literal("split").then(pitch).then(bank);
+        var polyArg = Commands.argument("poly", IntegerArgumentType.integer(1, 128))
+            .executes(context -> convert(context, getFile(context), engine, separate, place,
+                lanes(context), "pitch", poly(context)))
+            .then(split);
+        return Commands.literal("poly").then(polyArg);
+    }
+
+    private static int lanes(CommandContext<CommandSourceStack> context) {
+        return IntegerArgumentType.getInteger(context, "lanes");
+    }
+
+    private static int poly(CommandContext<CommandSourceStack> context) {
+        return IntegerArgumentType.getInteger(context, "poly");
     }
 
     private static String getFile(CommandContext<CommandSourceStack> context) {
@@ -134,21 +205,46 @@ public class RedStoneMusic {
 
     private static int convert(CommandContext<CommandSourceStack> context, String file,
                                String engine, boolean separate, boolean shouldPlace) {
+        return convert(context, file, engine, separate, shouldPlace, 0, "pitch", DEFAULT_POLY);
+    }
+
+    private static int convert(CommandContext<CommandSourceStack> context, String file,
+                               String engine, boolean separate, boolean shouldPlace, int lanes) {
+        return convert(context, file, engine, separate, shouldPlace, lanes, "pitch", DEFAULT_POLY);
+    }
+
+    private static int convert(CommandContext<CommandSourceStack> context, String file,
+                               String engine, boolean separate, boolean shouldPlace,
+                               int lanes, String split) {
+        return convert(context, file, engine, separate, shouldPlace, lanes, split, DEFAULT_POLY);
+    }
+
+    private static int convert(CommandContext<CommandSourceStack> context, String file,
+                               String engine, boolean separate, boolean shouldPlace,
+                               int lanes, String split, int polyCap) {
         if (!ready(context)) return 0;
         try {
             Path input = storage.resolveMp3(file);
             if (!Files.isRegularFile(input)) throw new IOException("mp3 文件不存在: " + file);
             String base = stripExtension(input.getFileName().toString());
+            String laneSuffix = lanes > 0 ? "_L" + lanes : "";
+            String splitSuffix = (lanes > 0 && "bank".equalsIgnoreCase(split)) ? "_bank" : "";
+            String polySuffix = (lanes > 0 && polyCap != DEFAULT_POLY) ? "_P" + polyCap : "";
             if (separate) {
-                // 多音轨：文件名带 <engine>_true 签名
-                Path output = storage.ntbDirectory().resolve(base + "_" + engine + "_true.ntb");
-                return multiConvert(context, input, output, engine, shouldPlace);
+                // 多音轨：文件名带 <engine>_true 签名；多轨结构再加 _L<N>[_bank][_P<cap>]
+                Path output = storage.ntbDirectory().resolve(
+                    base + "_" + engine + "_true" + laneSuffix + splitSuffix + polySuffix + ".ntb");
+                return multiConvert(context, input, output, engine, shouldPlace, lanes, split, polyCap);
             }
-            Path output = storage.ntbDirectory().resolve(base + "_" + engine + "_false.ntb");
-            LOGGER.info("CONVERT 开始: {} -> {}", input, output);
-            context.getSource().sendSuccess(() -> Component.literal("开始转换: " + file), false);
+            Path output = storage.ntbDirectory().resolve(
+                base + "_" + engine + "_false" + laneSuffix + splitSuffix + polySuffix + ".ntb");
+            LOGGER.info("CONVERT 开始: {} -> {} (lanes={}, split={}, poly={})",
+                input, output, lanes, split, polyCap);
+            context.getSource().sendSuccess(() -> Component.literal(
+                (lanes > 0 ? ("开始 " + lanes + " 轨(" + split + ", poly " + polyCap + ")结构转换: ")
+                    : "开始转换: ") + file), false);
             Path finalInput = input;
-            toolRunner.convertAsync(finalInput, output).whenComplete((result, error) -> {
+            toolRunner.convertAsync(finalInput, output, lanes, split, polyCap).whenComplete((result, error) -> {
                 ServerPlayer player;
                 try {
                     player = context.getSource().getPlayerOrException();
@@ -178,10 +274,30 @@ public class RedStoneMusic {
 
     private static int multiConvert(CommandContext<CommandSourceStack> context, Path input,
                                     Path output, String engine, boolean placeAfter) {
+        return multiConvert(context, input, output, engine, placeAfter, 0, "pitch", DEFAULT_POLY);
+    }
+
+    private static int multiConvert(CommandContext<CommandSourceStack> context, Path input,
+                                    Path output, String engine, boolean placeAfter, int lanes) {
+        return multiConvert(context, input, output, engine, placeAfter, lanes, "pitch", DEFAULT_POLY);
+    }
+
+    private static int multiConvert(CommandContext<CommandSourceStack> context, Path input,
+                                    Path output, String engine, boolean placeAfter, int lanes, String split) {
+        return multiConvert(context, input, output, engine, placeAfter, lanes, split, DEFAULT_POLY);
+    }
+
+    private static int multiConvert(CommandContext<CommandSourceStack> context, Path input,
+                                    Path output, String engine, boolean placeAfter,
+                                    int lanes, String split, int polyCap) {
         try {
             String engineLabel = "trad".equalsIgnoreCase(engine) ? "传统算法" : "AI(demucs)";
-            context.getSource().sendSuccess(() -> Component.literal("开始" + engineLabel + "多音轨转换: " + input.getFileName()), false);
-            toolRunner.convertMultiAsync(input, output, engine, 0.015).whenComplete((result, error) -> {
+            String laneLabel = lanes > 0
+                ? (" + " + lanes + " 轨(" + split + ", poly " + polyCap + ")结构") : "";
+            context.getSource().sendSuccess(() -> Component.literal(
+                "开始" + engineLabel + "多音轨转换" + laneLabel + ": " + input.getFileName()), false);
+            toolRunner.convertMultiAsync(input, output, engine, 0.015, lanes, split, polyCap)
+                .whenComplete((result, error) -> {
                 try {
                     ServerPlayer player = context.getSource().getPlayerOrException();
                     player.server.execute(() -> {

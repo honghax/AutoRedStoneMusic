@@ -4,6 +4,8 @@
 
 AutoRedStoneMusic 的目标，是把一首歌曲从普通音频文件直接变成可以在 Minecraft 世界中放置、播放和分享的红石音乐结构。用户只需要把 MP3 或 WAV 放入指定目录，即可在游戏内调用转换工具，生成 `.nbt` 结构并放置到玩家面前。
 
+> **本次更新（2026-10-31）**：新增**多轨直排结构**——在“最终 MIDI → NBT”阶段按音高/音色拆成 1~3 条并行红石轨道，所有轨道共享同一条时间轴骨架与单一拉杆起始总线，脉冲同步前进；`Convert` 新增 `lanes <N>`、`split pitch|bank`、`poly 1..128` 参数，默认仍走原版单轨 NBT；所有结构支撑方块统一替换为**平滑石英**（保留音符盒正下方的乐器垫块）；新增独立工具 `arrange_multilane.py`、`arrange_straight.py`、`eval_ntb_loss.py` 与两个调试结构。
+
 > **本次更新（2026-10-11）**：新增**音源分离多音轨转换**，提供 AI（Demucs）与传统算法（C++ REPET/HPSS）双引擎；支持按能量门限丢弃弱轨、逐轨转 MIDI 后合并、再复用原本三档音域扩展生成单条结构。同时修复非整秒总时长断言、24bit WAV 读取、分离写盘缩放导致还原度偏低等问题。
 
 ## 核心能力
@@ -25,6 +27,9 @@ AutoRedStoneMusic 的目标，是把一首歌曲从普通音频文件直接变�
 - **新增：能量门限丢轨**——按能量占比（默认 1.5%）自动丢弃低能量音轨，避免噪声轨污染结果。
 - **新增：多轨 MIDI 合并**——逐轨转写 MIDI 后合并为单一 MIDI，复用三档音域扩展（高音 bell / 中音 harp / 低音 bass）生成同一条结构。
 - **新增：内置结构调试放置**——`debug place <structure>` 直接放置模组自带结构，便于试听对比与内部调试。
+- **新增：多轨直排结构（可选）**——在“最终 MIDI → NBT”阶段按音高/音色拆成 1~3 条并行轨道；每条轨道有独立红石骨架，全部共享同一条时间轴列集合与单一拉杆起始总线，脉冲同步前进。
+- **新增：`lanes` / `split` / `poly` 命令参数**——默认仍生成原版单轨 NBT；`lanes` 启用多轨，`split` 选择按音高均衡或按音色档位分轨，`poly` 限制每轨单列复音上限（1~128，默认 20）。
+- **新增：统一建筑材质**——所有结构支撑/条带间隔方块改为 `minecraft:smooth_quartz`，仅保留音符盒正下方的乐器垫块（`dirt` / `bamboo_planks` / `gold_block`）以及折叠布局中功能性必需的 `glowstone`。
 
 ## 工作流程
 
@@ -80,6 +85,27 @@ merge_midis.exe 合并为单一 MIDI
 midi_to_nbt.exe 单轨三档映射 → Minecraft Structure NBT
 ```
 
+多轨结构（可选，2026-10-31 新增）：
+
+```text
+最终 MIDI（单轨直转结果，或分离后合并的 MIDI）
+   |
+   v
+arrange_multilane.exe
+   ├─ split pitch：按音高排序均衡分轨
+   ├─ split bank ：按 bass / harp / bell 音色分轨
+   └─ poly <N>   ：限制每轨单列复音（超出保留最高音）
+   |
+   v
+N 条平行直排红石轨道（各自 repeater + 支线 + 音符盒）
+   |
+   v
+共享起始总线（一个拉杆 + observer + 0 延迟红石粉）
+   |
+   v
+Minecraft Structure NBT
+```
+
 项目由以下独立的 Windows 工具组成：
 
 1. `audio_to_midi.exe`
@@ -105,11 +131,18 @@ midi_to_nbt.exe 单轨三档映射 → Minecraft Structure NBT
 5. `merge_midis.exe`（新增）
    - 把多轨 MIDI 合并为单一 MIDI（每轨分配独立 channel，避免同音高跨轨覆盖与首尾相接配对错误）。
 
+6. `arrange_multilane.exe`（新增）
+   - 可选的多轨结构生成器：读取最终 MIDI，按 `split` 分轨、按 `poly` 限制单列复音，生成 N 条平行直排轨道。
+   - 所有轨道共享同一条时间轴骨架，保证同一列音符在 X 上对齐；由同一条 0 延迟起始总线驱动，单一拉杆同步起步。
+   - 默认不启用；只有命令带 `lanes` 时才替代 `midi_to_nbt.exe`。
+
 模组通过 `ProcessBuilder` 调用这些 EXE，不使用 JNI，因此音频推理、音源分离和 NBT 生成与 Minecraft JVM 解耦，便于调试、替换和独立测试。
 
 ## 游戏内目录
 
-> **本次更新**：临时工具资源目录新增多音轨相关 EXE 与 Demucs 模型权重。
+> **本次更新（2026-10-31）**：临时工具资源目录新增 `arrange_multilane.exe`（多轨结构生成器）。
+>
+> **本次更新（2026-10-11）**：临时工具资源目录新增多音轨相关 EXE 与 Demucs 模型权重。
 
 首次启动后，模组会在 Minecraft 配置目录创建：
 
@@ -132,14 +165,17 @@ redstonemusic/tools/
 ├── demucs_mt.cpp.main.exe
 ├── ggml-model-htdemucs-4s-f16.bin
 ├── traditional_sep.exe
-└── merge_midis.exe
+├── merge_midis.exe
+└── arrange_multilane.exe
 ```
 
 上面的 `redstonemusic/tools/` 是临时工作目录中的资源目录，不是用户需要手动创建的配置目录。
 
 ## 游戏内命令
 
-> **本次更新**：`Convert` 增加引擎与多轨语法节点（`ai`/`trad`、`true`/`false`），`true`/`false` 作为命令语法组成而非字符串参数；新增 `debug place <structure>` 内置结构放置；生成文件名加入引擎与多轨签名。
+> **本次更新（2026-10-31）**：`Convert` 新增 `lanes <N>`、`split pitch|bank`、`poly 1..128` 语法节点；默认不写 `lanes` 时仍走原版单轨 NBT；生成文件名追加 `_L<N>[_bank][_P<cap>]` 签名。
+>
+> **本次更新（2026-10-11）**：`Convert` 增加引擎与多轨语法节点（`ai`/`trad`、`true`/`false`），`true`/`false` 作为命令语法组成而非字符串参数；新增 `debug place <structure>` 内置结构放置；生成文件名加入引擎与多轨签名。
 
 需要权限等级 2。命令同时提供大写主命令和小写兼容命令。
 
@@ -153,6 +189,12 @@ redstonemusic/tools/
 /RedStoneMusic Convert song.mp3 ai true
 /RedStoneMusic Convert song.mp3 trad true
 /RedStoneMusic Convert song.mp3 trad false
+/RedStoneMusic Convert song.mp3 lanes 3
+/RedStoneMusic Convert song.mp3 lanes 3 poly 8
+/RedStoneMusic Convert song.mp3 lanes 3 split bank
+/RedStoneMusic Convert song.mp3 lanes 3 split bank poly 8
+/RedStoneMusic Convert song.mp3 true lanes 3 poly 8
+/RedStoneMusic Convert song.mp3 trad true lanes 3 split bank poly 12
 /RedStoneMusic place song.ntb
 /RedStoneMusic debug place <structure>
 ```
@@ -170,25 +212,45 @@ redstonemusic/tools/
 - `Convert song.mp3 trad false`：显式指定传统引擎但不启用多音轨分离。
 - `place song.ntb`：读取已有 NBT 并放置结构。
 - `debug place <structure>`：放置模组内置结构资源（`data/redstone_music/structures/<structure>.nbt`），无需文件位于 `ntb` 目录，便于内部试听对比。
+- `Convert song.mp3 lanes 3`：把最终 MIDI 生成 **3 条并行直排轨道**（默认 `split=pitch`、`poly=20`）。
+- `Convert song.mp3 lanes 3 poly 8`：每轨单列最多保留 8 个音符，超出保留最高音；`poly` 范围 1~128。
+- `Convert song.mp3 lanes 3 split bank`：按 `bass / harp / bell` 音色分轨，而不是按音高均衡分轨。
+- `Convert song.mp3 true lanes 3 ...`：先做 AI 多音轨分离，再把合并后的最终 MIDI 生成 3 轨结构。
+- `Convert song.mp3 trad true lanes 3 ...`：传统分离 + 3 轨结构。
 
-生成文件名为 `<原名>_<引擎>_<是否多轨>.ntb`，例如单轨 AI 转换 `a_ai_false.ntb`、传统多轨转换 `a_trad_true.ntb`。输入文件只允许使用配置目录下的单个文件名，模组会检查扩展名并阻止路径穿越。
+生成文件名为 `<原名>_<引擎>_<是否多轨>[_L<N>][_bank][_P<cap>].ntb`，例如：单轨 AI 转换 `a_ai_false.ntb`、传统多轨转换 `a_trad_true.ntb`、3 轨 pitch/poly20 `a_ai_false_L3.ntb`、3 轨 bank/poly8 `a_ai_false_L3_bank_P8.ntb`。输入文件只允许使用配置目录下的单个文件名，模组会检查扩展名并阻止路径穿越。
 
 ## 测试结果
 
-> **本次更新**：新增多音轨（AI / 传统分离 → 能量门限 → 逐轨 MIDI → 合并 → 单轨三档）结构测试；补充 C++ 传统分离还原度核验——把分离出的音轨合成回原曲，与原始音频的相似度（相关系数）约 0.98 量级，确认分离与写盘环节保真。
+> **本次更新（2026-10-31）**：补充卡农（无 vocals）前 30 秒的单轨 vs 传统分离对比，以及 3 轨直排结构实测；新增 MIDI/NBT 损失量化工具与结果。结构支撑材质统一为平滑石英。
+>
+> **本次更新（2026-10-11）**：新增多音轨（AI / 传统分离 → 能量门限 → 逐轨 MIDI → 合并 → 单轨三档）结构测试；补充 C++ 传统分离还原度核验——把分离出的音轨合成回原曲，与原始音频的相似度（相关系数）约 0.98 量级，确认分离与写盘环节保真。
 
-测试视频是转换结果和歌曲展示，视频播放时长不等于转换耗时。下面的“转换耗时”指从输入音频开始，经由音频解码、ONNX 推理、MIDI 生成、NBT 生成到结果文件完成的全流程耗时。
+下面的“转换耗时”指从输入音频开始，经由音频解码、ONNX 推理、MIDI 生成、NBT 生成到结果文件完成的全流程耗时。
 
-| 测试歌曲 | 全流程转换耗时 | 测试内容 | 视频 |
-| --- | ---: | --- | --- |
-| 千本樱 | 约 34 秒 | MP4 音频提取后完成 MP3/WAV → MIDI → NBT，并在 Minecraft 中展示红石结构 | [观看测试视频](./千本樱.mp4) |
-| 义勇军进行曲 | 约 4 秒 | MP4 音频提取后完成 MP3/WAV → MIDI → NBT，并在 Minecraft 中展示红石结构 | [观看测试视频](./义勇军进行曲.mp4) |
+| 测试歌曲 | 全流程转换耗时 | 测试内容 |
+| --- | ---: | --- |
+| 千本樱 | 约 34 秒 | MP4 音频提取后完成 MP3/WAV → MIDI → NBT，并在 Minecraft 中展示红石结构 |
+| 义勇军进行曲 | 约 4 秒 | MP4 音频提取后完成 MP3/WAV → MIDI → NBT，并在 Minecraft 中展示红石结构 |
 
 多音轨额外验证：
 
 - 传统 C++ 分离单曲（约 56s 素材）分离阶段约 4.6 秒，明显快于等价的纯 Python 实现。
 - 分离音轨重新合成回原曲，与源音频相似度约 0.98，残差归一化后约 0.03，说明分离与写盘未引入可听失真。
 - 生成的测试结构：`merged.nbt`（AI 多轨）、`trad_merged.nbt`（传统多轨）、`ap4_merged.nbt`。
+
+卡农 30s / 多轨结构验证（2026-10-31）：
+
+| 指标 | 单轨直转 | 传统分离 |
+| --- | ---: | ---: |
+| 音符数 | 187 | 589 |
+| 全局 chroma 余弦 | 0.9297 | 0.9310 |
+| 谐波覆盖率 | 56.6% | 63.3% |
+| 逐音符音级 top1 / top3 | 54.5% / 89.8% | 49.7% / 82.0% |
+
+- 3 轨直排结构（`split=pitch`，`poly=6`）：197 / 196 / 196 音符，size 699×2×27，音符盒 445，共享起始总线最远 10 格；自校验不可达 0、音符盒贴粉 0。
+- 平滑石英验证：支撑方块 3324 个 `smooth_quartz`，`dirt` 仅 320 个且全部位于音符盒正下方；bass/bell 垫块 `bamboo_planks` / `gold_block` 保持不变。
+- 调试结构：`canon_roles_straight.nbt`（按角色分声部单轨）、`canon_multilane.nbt`（3 轨）。
 
 测试覆盖：
 
@@ -275,6 +337,9 @@ python -m PyInstaller --clean --noconfirm `
 
 python -m PyInstaller --clean --noconfirm `
   tools\some-onnx\packaging\midi_to_nbt.spec
+
+python -m PyInstaller --clean --noconfirm `
+  tools\some-onnx\packaging\arrange_multilane.spec
 ```
 
 ### 构建 Forge 模组
@@ -287,7 +352,9 @@ python -m PyInstaller --clean --noconfirm `
 
 ## 项目结构
 
-> **本次更新**：新增 `cpp/traditional_sep/`（C++ 传统分离）、`cpp/eigen/`（Eigen 头文件）、`src/merge_midis.py`（MIDI 合并）、`src/traditional_separate.py`（Python 参考实现）与 `MultiTrackNbtMerger.java`。
+> **本次更新（2026-10-31）**：新增 `src/arrange_multilane.py`（最终 MIDI → 多轨直排）、`src/arrange_straight.py`（多角色 → 单条直排）、`src/eval_ntb_loss.py`（损失量化）、`packaging/arrange_multilane.spec` 与调试结构 `canon_roles_straight.nbt` / `canon_multilane.nbt`。
+>
+> **本次更新（2026-10-11）**：新增 `cpp/traditional_sep/`（C++ 传统分离）、`cpp/eigen/`（Eigen 头文件）、`src/merge_midis.py`（MIDI 合并）、`src/traditional_separate.py`（Python 参考实现）与 `MultiTrackNbtMerger.java`。
 
 ```text
 src/main/java/com/redstonemusic/   Forge 模组与命令实现
@@ -296,8 +363,13 @@ src/main/resources/                模组元数据和运行时工具资源
  tools/some-onnx/cpp/traditional_sep/   C++ 传统音源分离
  tools/some-onnx/cpp/eigen/         Eigen 头文件库
  tools/some-onnx/src/              MIDI、NBT 和 Python 辅助源码
+ tools/some-onnx/src/arrange_multilane.py   最终 MIDI → 多轨直排结构
+ tools/some-onnx/src/arrange_straight.py    多角色 MIDI → 单条直排结构
+ tools/some-onnx/src/eval_ntb_loss.py       MIDI/NBT 损失量化
  tools/some-onnx/packaging/        PyInstaller 构建规格
+ tools/some-onnx/packaging/arrange_multilane.spec   多轨工具打包规格
  tools/some-onnx/runtime/          EXE、DLL、FFmpeg 和模型权重
+ src/main/resources/data/redstone_music/structures/  内置调试结构（含 canon_*.nbt）
 ```
 
 ## 安全说明与服务器管理员须知
@@ -308,7 +380,7 @@ src/main/resources/                模组元数据和运行时工具资源
 
 ### 为什么会释放并启动 EXE/DLL
 
-模组 JAR 内包含固定版本的 `audio_to_midi.exe`、`midi_to_nbt.exe`、`demucs_mt.cpp.main.exe`、`traditional_sep.exe`、`merge_midis.exe`、Demucs 模型权重、FFmpeg、ONNX Runtime DLL 和 `nmp.onnx` 权重。初始化时，模组把这些资源复制到系统临时目录下新建的 `RedStoneMusic-*` 工作目录。这样做是为了让 Windows 能从普通文件路径加载可执行文件和 DLL；它们不是从网络下载的，也不会从歌曲文件中提取或安装程序。转换命令通过 `ProcessBuilder` 以参数列表启动这些指定 EXE，而不是经由 shell 拼接命令。
+模组 JAR 内包含固定版本的 `audio_to_midi.exe`、`midi_to_nbt.exe`、`arrange_multilane.exe`、`demucs_mt.cpp.main.exe`、`traditional_sep.exe`、`merge_midis.exe`、Demucs 模型权重、FFmpeg、ONNX Runtime DLL 和 `nmp.onnx` 权重。初始化时，模组把这些资源复制到系统临时目录下新建的 `RedStoneMusic-*` 工作目录。这样做是为了让 Windows 能从普通文件路径加载可执行文件和 DLL；它们不是从网络下载的，也不会从歌曲文件中提取或安装程序。转换命令通过 `ProcessBuilder` 以参数列表启动这些指定 EXE，而不是经由 shell 拼接命令。
 
 ### 文件访问和清理范围
 

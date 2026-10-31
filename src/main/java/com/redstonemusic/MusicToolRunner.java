@@ -26,6 +26,7 @@ public final class MusicToolRunner implements AutoCloseable {
     private static final String DEMUCS_MODEL = "/redstonemusic/tools/ggml-model-htdemucs-4s-f16.bin";
     private static final String TRAD_EXE = "/redstonemusic/tools/traditional_sep.exe";
     private static final String MERGE_EXE = "/redstonemusic/tools/merge_midis.exe";
+    private static final String MULTILANE_EXE = "/redstonemusic/tools/arrange_multilane.exe";
 
     private final Path workDirectory;
     private final ExecutorService executor = Executors.newCachedThreadPool(r -> {
@@ -49,6 +50,7 @@ public final class MusicToolRunner implements AutoCloseable {
         // 传统算法分离（C++）与 MIDI 合并（多音轨流程资源）
         release(TRAD_EXE);
         release(MERGE_EXE);
+        release(MULTILANE_EXE);
         Runtime.getRuntime().addShutdownHook(new Thread(this::close, "RedStoneMusic-tool-cleanup"));
     }
 
@@ -57,6 +59,18 @@ public final class MusicToolRunner implements AutoCloseable {
     }
 
     public CompletableFuture<Path> convertAsync(Path input, Path output) {
+        return convertAsync(input, output, 0, "pitch", 20);
+    }
+
+    public CompletableFuture<Path> convertAsync(Path input, Path output, int lanes) {
+        return convertAsync(input, output, lanes, "pitch", 20);
+    }
+
+    public CompletableFuture<Path> convertAsync(Path input, Path output, int lanes, String split) {
+        return convertAsync(input, output, lanes, split, 20);
+    }
+
+    public CompletableFuture<Path> convertAsync(Path input, Path output, int lanes, String split, int polyCap) {
         return CompletableFuture.supplyAsync(() -> {
             Path jobDirectory;
             try {
@@ -70,8 +84,17 @@ public final class MusicToolRunner implements AutoCloseable {
                 Path midi = jobDirectory.resolve(input.getFileName() + ".mid");
                 run(jobDirectory, List.of(workDirectory.resolve("audio_to_midi.exe").toString(),
                         wav.toString(), midi.toString()));
-                run(jobDirectory, List.of(workDirectory.resolve("midi_to_nbt.exe").toString(),
-                        midi.toString(), output.toString(), "--resolution", "2", "--layout", "simple"));
+                String splitMode = "bank".equalsIgnoreCase(split) ? "bank" : "pitch";
+                int cap = Math.max(1, Math.min(128, polyCap));
+                if (lanes > 0) {
+                    run(jobDirectory, List.of(workDirectory.resolve("arrange_multilane.exe").toString(),
+                            "--midi", midi.toString(), "--out", output.toString(),
+                            "--lanes", Integer.toString(lanes), "--split", splitMode,
+                            "--resolution", "2", "--poly-cap", Integer.toString(cap), "--lane-gap", "2"));
+                } else {
+                    run(jobDirectory, List.of(workDirectory.resolve("midi_to_nbt.exe").toString(),
+                            midi.toString(), output.toString(), "--resolution", "2", "--layout", "simple"));
+                }
                 return output;
             } finally {
                 deleteTree(jobDirectory);
@@ -88,6 +111,23 @@ public final class MusicToolRunner implements AutoCloseable {
      */
     public CompletableFuture<Path> convertMultiAsync(Path input, Path output,
                                                      String engine, double minEnergy) {
+        return convertMultiAsync(input, output, engine, minEnergy, 0, "pitch", 20);
+    }
+
+    public CompletableFuture<Path> convertMultiAsync(Path input, Path output,
+                                                     String engine, double minEnergy, int lanes) {
+        return convertMultiAsync(input, output, engine, minEnergy, lanes, "pitch", 20);
+    }
+
+    public CompletableFuture<Path> convertMultiAsync(Path input, Path output,
+                                                     String engine, double minEnergy,
+                                                     int lanes, String split) {
+        return convertMultiAsync(input, output, engine, minEnergy, lanes, split, 20);
+    }
+
+    public CompletableFuture<Path> convertMultiAsync(Path input, Path output,
+                                                     String engine, double minEnergy,
+                                                     int lanes, String split, int polyCap) {
         return CompletableFuture.supplyAsync(() -> {
             Path jobDirectory;
             try {
@@ -154,10 +194,19 @@ public final class MusicToolRunner implements AutoCloseable {
                 midis.forEach(m -> mergeCmd.add(m.toString()));
                 mergeCmd.add(mergedMidi.toString());
                 run(jobDirectory, mergeCmd);
-                run(jobDirectory, List.of(workDirectory.resolve("midi_to_nbt.exe").toString(),
-                        mergedMidi.toString(), output.toString(),
-                        "--seconds", String.format(Locale.ROOT, "%.6f", seconds),
-                        "--resolution", "2", "--layout", "simple"));
+                String splitMode = "bank".equalsIgnoreCase(split) ? "bank" : "pitch";
+                int cap = Math.max(1, Math.min(128, polyCap));
+                if (lanes > 0) {
+                    run(jobDirectory, List.of(workDirectory.resolve("arrange_multilane.exe").toString(),
+                            "--midi", mergedMidi.toString(), "--out", output.toString(),
+                            "--lanes", Integer.toString(lanes), "--split", splitMode,
+                            "--resolution", "2", "--poly-cap", Integer.toString(cap), "--lane-gap", "2"));
+                } else {
+                    run(jobDirectory, List.of(workDirectory.resolve("midi_to_nbt.exe").toString(),
+                            mergedMidi.toString(), output.toString(),
+                            "--seconds", String.format(Locale.ROOT, "%.6f", seconds),
+                            "--resolution", "2", "--layout", "simple"));
+                }
                 RedStoneMusic.LOGGER.info("多音轨转换完成: {}（引擎={}，保留 {} 轨，丢弃 {} 轨）",
                         output, engine, kept.size(), stemWavs.size() - kept.size());
                 return output;
