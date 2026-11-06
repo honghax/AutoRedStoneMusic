@@ -4,6 +4,8 @@
 
 AutoRedStoneMusic 的目标，是把一首歌曲从普通音频文件直接变成可以在 Minecraft 世界中放置、播放和分享的红石音乐结构。用户只需要把 MP3 或 WAV 放入指定目录，即可在游戏内调用转换工具，生成 `.nbt` 结构并放置到玩家面前。
 
+> **本次更新（2026-11-06）**：`midi_to_nbt.exe`、`arrange_multilane.exe`、`merge_midis.exe` 已由 Python/PyInstaller **重写为 C++17**，逐方块/逐音符输出与旧版一致；实测提速约 **108× / 53× / 145×**，模组 JAR 因此缩小约 **54 MB**。新增独立的 **NTB → NBS（Note Block Studio）** 导出工具。README 补充了从克隆仓库到构建模组的完整步骤（含 Git LFS）。
+
 > **本次更新（2026-10-31）**：新增**多轨直排结构**——在“最终 MIDI → NBT”阶段按音高/音色拆成 1~3 条并行红石轨道，所有轨道共享同一条时间轴骨架与单一拉杆起始总线，脉冲同步前进；`Convert` 新增 `lanes <N>`、`split pitch|bank`、`poly 1..128` 参数，默认仍走原版单轨 NBT；所有结构支撑方块统一替换为**平滑石英**（保留音符盒正下方的乐器垫块）；新增独立工具 `arrange_multilane.py`、`arrange_straight.py`、`eval_ntb_loss.py` 与两个调试结构。
 
 > **本次更新（2026-10-11）**：新增**音源分离多音轨转换**，提供 AI（Demucs）与传统算法（C++ REPET/HPSS）双引擎；支持按能量门限丢弃弱轨、逐轨转 MIDI 后合并、再复用原本三档音域扩展生成单条结构。同时修复非整秒总时长断言、24bit WAV 读取、分离写盘缩放导致还原度偏低等问题。
@@ -30,6 +32,8 @@ AutoRedStoneMusic 的目标，是把一首歌曲从普通音频文件直接变�
 - **新增：多轨直排结构（可选）**——在“最终 MIDI → NBT”阶段按音高/音色拆成 1~3 条并行轨道；每条轨道有独立红石骨架，全部共享同一条时间轴列集合与单一拉杆起始总线，脉冲同步前进。
 - **新增：`lanes` / `split` / `poly` 命令参数**——默认仍生成原版单轨 NBT；`lanes` 启用多轨，`split` 选择按音高均衡或按音色档位分轨，`poly` 限制每轨单列复音上限（1~128，默认 20）。
 - **新增：统一建筑材质**——所有结构支撑/条带间隔方块改为 `minecraft:smooth_quartz`，仅保留音符盒正下方的乐器垫块（`dirt` / `bamboo_planks` / `gold_block`）以及折叠布局中功能性必需的 `glowstone`。
+- **新增：C++17 快速工具链**——`midi_to_nbt` / `arrange_multilane` / `merge_midis` 已从 Python/PyInstaller 重写为 C++17，输出与原版一致，速度提升约 53×~145×，模组 JAR 缩小约 54 MB。
+- **新增：NTB → NBS 导出**——独立 C++ 工具 `ntb_to_nbs.exe` 可把已生成的红石结构转换为 Note Block Studio 的 `.nbs`（v4，20 TPS），便于在 NBS 中查看、编辑和二次分享。
 
 ## 工作流程
 
@@ -109,32 +113,32 @@ Minecraft Structure NBT
 项目由以下独立的 Windows 工具组成：
 
 1. `audio_to_midi.exe`
-   - C++17 实现。
-   - 使用 ONNX Runtime C++ API 加载 `nmp.onnx`。
-   - 调用 FFmpeg 将 MP3/WAV 转成 22050 Hz、单声道 PCM。
-   - 输出 Standard MIDI。
+   - Python 转换管线（basic_pitch + onnxruntime）通过 PyInstaller 打包为独立 EXE。
+   - 调用 FFmpeg 将 MP3/WAV 转成 22050 Hz、单声道 PCM，输出 Standard MIDI。
+   - 仓库另含 `tools/some-onnx/cpp/` 的 C++ ONNX 参考实现，可用 `build_win.ps1` 构建。
 
-2. `midi_to_nbt.exe`
-   - Python 生成器通过 PyInstaller 打包为独立 EXE。
-   - 读取 MIDI 并生成 Minecraft Structure NBT。
-   - 保留音符量化、线路布局、延音和结构校验逻辑。
+2. `midi_to_nbt.exe`（C++17，2026-11-06 重写）
+   - 读取 MIDI 并生成 Minecraft Structure NBT；支持 folded/simple、延音与音轨音色。
+   - 源码在 `tools/some-onnx/cpp/fast_tools/`，运行时已替换为 C++ 版。
+   - 与旧 Python 版逐方块一致，实测约 108× 提速。
 
-3. `demucs_mt.cpp.main.exe`（新增）
-   - AI 音源分离引擎（Demucs htdemucs，4 轨：drums / bass / other / vocals）。
-   - C++ 多线程纯 CPU 推理，配套 `ggml-model-htdemucs-4s-f16.bin` 模型权重。
+3. `merge_midis.exe`（C++17，2026-11-06 重写）
+   - 把多轨 MIDI 合并为单一 MIDI（每源独立 channel，同 tick 先 off 后 on）。
+   - 与旧版音符事件一致，实测约 145× 提速。
 
-4. `traditional_sep.exe`（新增）
-   - 传统算法音源分离（C++17 + Eigen，纯 CPU）。
-   - 流程：STFT → REPET-SIM（人声/伴奏，非局部中值滤波 + Wiener 软掩蔽）→ HPSS（鼓/谐波）→ 谐波频段切分（贝斯 <250Hz / 吉他 250~1000Hz / 钢琴 >1kHz / other 为剩余）。
-   - 固定输出 6 类：drums / bass / other / vocals / guitar / piano；硬编码 7 物理线程。
+4. `arrange_multilane.exe`（C++17，2026-11-06 重写）
+   - 可选多轨结构生成器：按 `split` 分轨、按 `poly` 限复音，生成 1~3 条平行直排轨道。
+   - 所有轨道共享时间轴骨架与单一拉杆起始总线；与旧版逐方块一致，实测约 53× 提速。
 
-5. `merge_midis.exe`（新增）
-   - 把多轨 MIDI 合并为单一 MIDI（每轨分配独立 channel，避免同音高跨轨覆盖与首尾相接配对错误）。
+5. `demucs_mt.cpp.main.exe`
+   - AI 音源分离（Demucs htdemucs，4 轨），C++ 多线程 CPU 推理 + 模型权重。
 
-6. `arrange_multilane.exe`（新增）
-   - 可选的多轨结构生成器：读取最终 MIDI，按 `split` 分轨、按 `poly` 限制单列复音，生成 N 条平行直排轨道。
-   - 所有轨道共享同一条时间轴骨架，保证同一列音符在 X 上对齐；由同一条 0 延迟起始总线驱动，单一拉杆同步起步。
-   - 默认不启用；只有命令带 `lanes` 时才替代 `midi_to_nbt.exe`。
+6. `traditional_sep.exe`
+   - 传统算法分离（C++17 + Eigen，6 轨，7 线程）。
+
+7. `ntb_to_nbs.exe`（独立工具，2026-11-06 新增，未打进模组）
+   - NTB → Note Block Studio `.nbs`（v4，20 TPS）。
+   - 源码在 `tools/some-onnx/cpp/ntb_to_nbs/`；按乐器基准音高映射 NBS key（0=A0，harp 33~57、bass 9~33、bell 57~81）。
 
 模组通过 `ProcessBuilder` 调用这些 EXE，不使用 JNI，因此音频推理、音源分离和 NBT 生成与 Minecraft JVM 解耦，便于调试、替换和独立测试。
 
@@ -252,6 +256,25 @@ redstonemusic/tools/
 - 平滑石英验证：支撑方块 3324 个 `smooth_quartz`，`dirt` 仅 320 个且全部位于音符盒正下方；bass/bell 垫块 `bamboo_planks` / `gold_block` 保持不变。
 - 调试结构：`canon_roles_straight.nbt`（按角色分声部单轨）、`canon_multilane.nbt`（3 轨）。
 
+C++ 重写等价性与提速（2026-11-06）：
+
+| 用例 | 旧版（Python） | C++ 版 | 结果 |
+| --- | --- | --- | --- |
+| `midi_to_nbt` folded | 2345 方块 / 187 音符 | 同 | PASS |
+| `midi_to_nbt` simple | 2044 方块 / 187 音符 | 同 | PASS |
+| `--sustain` | 6147 方块 / 584 音符 | 同 | PASS |
+| `arrange_multilane` 3 轨 | 7534 方块 / 445 音符 | 同 | PASS |
+| `merge_midis` 4 stems | 589 音符事件 | 同 | PASS |
+| 完整链路 merge → midi_to_nbt | 4406 方块 | 同 | PASS |
+
+| 工具 | 旧版中位数 | C++ 版中位数 | 提速 |
+| --- | ---: | ---: | ---: |
+| `midi_to_nbt` | 1413.1 ms | 13.1 ms | **107.9×** |
+| `arrange_multilane` | 1948.8 ms | 36.7 ms | **53.1×** |
+| `merge_midis` | 823.8 ms | 5.7 ms | **144.5×** |
+
+计时包含旧版 PyInstaller 启动开销；不同机器上会有波动，复测 `midi_to_nbt` 约 1.49~1.70 s → 17.1~17.6 ms。
+
 测试覆盖：
 
 - 音频解码与模型推理。
@@ -297,50 +320,86 @@ redstonemusic/tools/
 
 ## 构建要求
 
-> **本次更新**：新增传统分离工具的 C++ 构建（MSVC + CMake/Ninja，Eigen 为 header-only，已随仓库提供）；传统分离不再使用 PyInstaller 打包。
+> **本次更新（2026-11-06）**：补充从克隆到构建的完整步骤；`midi_to_nbt` / `arrange_multilane` / `merge_midis` 改为 C++17 构建，不再使用 PyInstaller；运行时二进制通过 Git LFS 管理。
 
-- Windows 10/11
-- Java 17
-- Minecraft 1.20.1
-- Forge 47.4.16
-- Visual Studio 2022 C++ 工具链
-- CMake 与 Ninja
-- Python 3.x
-- PyInstaller
-- ONNX Runtime Windows x64 C++ SDK 1.29.0
+### 前置环境
 
-### 构建 C++ 音频工具
+| 依赖 | 用途 | 要求 |
+| --- | --- | --- |
+| Windows 10/11 x64 | 运行与构建 | — |
+| JDK 17 | Forge 模组 | 17 |
+| Git + Git LFS | 拉取运行时 EXE/DLL | 较新版本 |
+| Visual Studio 2022 C++ 工具链 | C++ 工具 | MSVC v143 / x64 |
+| CMake + Ninja | C++ 工具 | CMake 3.16+ |
+| Python 3.x + PyInstaller | 仅重建 `audio_to_midi.exe` | 3.9+ |
+| ONNX Runtime Windows x64 C++ SDK 1.29.0 | 仅重建 C++ `audio_to_midi` 参考实现 | 1.29.0 |
+
+目标运行时：Minecraft 1.20.1 + Forge 47.4.16（Forge 依赖由 Gradle 自动解析）。
+
+### 从克隆到构建（模组）
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File tools\some-onnx\cpp\build_win.ps1 `
-  -OrtRoot "E:\path\to\onnxruntime-win-x64-1.29.0"
+git clone https://github.com/honghax/AutoRedStoneMusic.git RedStoneMusic-local
+cd RedStoneMusic-local
+git lfs install
+git lfs pull
+.\gradlew.bat build --no-daemon
 ```
 
-构建结果位于被忽略的 `tools/some-onnx/cpp-build/`。构建脚本会自动查找 CMake、Ninja 和 MSVC，并清理旧的 CMake 配置缓存。
+- `tools/some-onnx/runtime/` 已包含运行时 EXE/DLL（Git LFS）；`processResources` 会把它们复制到 JAR 内的 `redstonemusic/tools/`。
+- **只要 LFS 拉取成功，无需重建任何工具即可构建模组。**
+- 构建产物：`build/libs/redstone_music-*.jar`。
+- 若没执行 `git lfs pull`，克隆下来的 EXE/DLL 只是指针文件：模组能构建，但运行时会失败。
 
-### 构建传统分离工具（C++）
+### 重建 C++ 快速工具（可选）
 
-`tools/some-onnx/cpp/traditional_sep/` 是独立的 CMake 工程，依赖同目录下的 header-only Eigen（`tools/some-onnx/cpp/eigen`）：
+`midi_to_nbt`、`arrange_multilane`、`merge_midis` 的源码在 `tools/some-onnx/cpp/fast_tools/`：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tools\some-onnx\cpp\fast_tools\build.ps1
+```
+
+脚本会自动查找 CMake/Ninja/MSVC，产物在 `tools/some-onnx/cpp/fast_tools/build/`。替换运行时：
+
+```powershell
+Copy-Item tools\some-onnx\cpp\fast_tools\build\fast_midi_to_nbt.exe tools\some-onnx\runtime\midi_to_nbt.exe -Force
+Copy-Item tools\some-onnx\cpp\fast_tools\build\fast_arrange_multilane.exe tools\some-onnx\runtime\arrange_multilane.exe -Force
+Copy-Item tools\some-onnx\cpp\fast_tools\build\fast_merge_midis.exe tools\some-onnx\runtime\merge_midis.exe -Force
+```
+
+### 重建传统分离工具（C++）
+
+`tools/some-onnx/cpp/traditional_sep/` 是独立 CMake 工程，依赖 header-only Eigen：
 
 ```powershell
 cmake -S tools\some-onnx\cpp\traditional_sep -B tools\some-onnx\cpp-build\traditional_sep -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build tools\some-onnx\cpp-build\traditional_sep
 ```
 
-### 构建 Python 工具
-
-使用包含 `basic_pitch`、`pretty_midi`、`mido`、`nbtlib` 和 PyInstaller 的 Python 环境：
+### 构建 NTB → NBS（C++，可选）
 
 ```powershell
-python -m PyInstaller --clean --noconfirm `
-  tools\some-onnx\packaging\audio_to_midi.spec
-
-python -m PyInstaller --clean --noconfirm `
-  tools\some-onnx\packaging\midi_to_nbt.spec
-
-python -m PyInstaller --clean --noconfirm `
-  tools\some-onnx\packaging\arrange_multilane.spec
+cmake -S tools\some-onnx\cpp\ntb_to_nbs -B tools\some-onnx\cpp-build\ntb_to_nbs -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build tools\some-onnx\cpp-build\ntb_to_nbs
 ```
+
+产物：`tools/some-onnx/cpp-build/ntb_to_nbs/ntb_to_nbs.exe`，独立使用，不复制进运行时。
+
+> CMake/Ninja 不在 PATH 时，请在 Visual Studio 的 Developer PowerShell 中运行；`fast_tools/build.ps1` 会自动查找。
+
+### 重建 audio_to_midi（PyInstaller）
+
+使用包含 `basic_pitch`、`pretty_midi`、`mido`、`soundfile`、`librosa`、`resampy`、`soxr`、`onnxruntime`、PyInstaller 的 Python 环境：
+
+```powershell
+python -m PyInstaller --clean --noconfirm tools\some-onnx\packaging\audio_to_midi.spec
+```
+
+产物在 `dist/audio_to_midi.exe`，复制到 `tools/some-onnx/runtime/audio_to_midi.exe` 即可。
+
+> 仓库中的 C++ ONNX 参考实现可用 `powershell -ExecutionPolicy Bypass -File tools\some-onnx\cpp\build_win.ps1 -OrtRoot "E:\path\to\onnxruntime-win-x64-1.29.0"` 构建；当前运行时使用上面的 PyInstaller 版本。
+>
+> `midi_to_nbt.spec`、`arrange_multilane.spec`、`merge_midis.spec` 是旧的 PyInstaller 规格，已被 C++ 版取代；不要用它们覆盖当前运行时。
 
 ### 构建 Forge 模组
 
@@ -348,10 +407,12 @@ python -m PyInstaller --clean --noconfirm `
 .\gradlew.bat build --no-daemon
 ```
 
-最终模组 JAR 位于 `build/libs/`。构建资源会被复制到 JAR 内的 `redstonemusic/tools/`。
+最终 JAR 在 `build/libs/`，运行时资源位于 JAR 内的 `redstonemusic/tools/`。
 
 ## 项目结构
 
+> **本次更新（2026-11-06）**：新增 `cpp/fast_tools/`（C++17 版 `midi_to_nbt` / `arrange_multilane` / `merge_midis`）与 `cpp/ntb_to_nbs/`（NTB → NBS）。
+>
 > **本次更新（2026-10-31）**：新增 `src/arrange_multilane.py`（最终 MIDI → 多轨直排）、`src/arrange_straight.py`（多角色 → 单条直排）、`src/eval_ntb_loss.py`（损失量化）、`packaging/arrange_multilane.spec` 与调试结构 `canon_roles_straight.nbt` / `canon_multilane.nbt`。
 >
 > **本次更新（2026-10-11）**：新增 `cpp/traditional_sep/`（C++ 传统分离）、`cpp/eigen/`（Eigen 头文件）、`src/merge_midis.py`（MIDI 合并）、`src/traditional_separate.py`（Python 参考实现）与 `MultiTrackNbtMerger.java`。
@@ -362,6 +423,8 @@ src/main/resources/                模组元数据和运行时工具资源
  tools/some-onnx/cpp/              C++ 音频推理源码与构建脚本
  tools/some-onnx/cpp/traditional_sep/   C++ 传统音源分离
  tools/some-onnx/cpp/eigen/         Eigen 头文件库
+ tools/some-onnx/cpp/fast_tools/    C++17 快速工具（midi_to_nbt / arrange_multilane / merge_midis）
+ tools/some-onnx/cpp/ntb_to_nbs/    NTB → NBS 转换器
  tools/some-onnx/src/              MIDI、NBT 和 Python 辅助源码
  tools/some-onnx/src/arrange_multilane.py   最终 MIDI → 多轨直排结构
  tools/some-onnx/src/arrange_straight.py    多角色 MIDI → 单条直排结构

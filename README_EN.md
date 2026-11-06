@@ -4,6 +4,8 @@ A Forge mod and local toolchain that converts ordinary audio into playable Minec
 
 AutoRedStoneMusic takes an MP3 or WAV file and turns it into a Minecraft Structure NBT file containing note blocks and redstone timing. The generated structure can be saved, shared, loaded again, and placed directly in front of the player from inside Minecraft.
 
+> **Update (2026-11-06)**: `midi_to_nbt.exe`, `arrange_multilane.exe`, and `merge_midis.exe` were **rewritten in C++17** from Python/PyInstaller. Their block/note output matches the originals exactly, with measured speedups of about **108× / 53× / 145×** and a **~54 MB** smaller mod JAR. Added a standalone **NTB → NBS (Note Block Studio)** exporter. The README now documents the full clone-to-build flow, including Git LFS.
+
 > **Update (2026-10-31)**: Added **multi-lane straight structures** — at the "final MIDI → NBT" stage, notes are split into 1–3 parallel redstone lanes. All lanes share one timeline skeleton and one lever-driven start bus, so their pulses march in sync. `Convert` gained `lanes <N>`, `split pitch|bank`, and `poly 1..128`; omitting `lanes` keeps the original single-track NBT path. All structural support blocks now use **smooth quartz** (instrument pads directly under note blocks are preserved). Added standalone tools `arrange_multilane.py`, `arrange_straight.py`, `eval_ntb_loss.py`, and two debug structures.
 
 > **Update (2026-10-11)**: Added **source-separation multi-track conversion** with two engines — AI (Demucs) and a traditional algorithm (C++ REPET/HPSS). It supports discarding weak stems via an energy threshold, transcribing each stem to MIDI and merging them, then reusing the original three-bank pitch expansion to produce a single structure. Also fixed the non-integer duration assertion, 24-bit WAV reading, and a write-out scaling bug that lowered reconstruction fidelity.
@@ -30,6 +32,8 @@ AutoRedStoneMusic takes an MP3 or WAV file and turns it into a Minecraft Structu
 - **New: optional multi-lane straight structures** — at the "final MIDI → NBT" stage, notes are split by pitch/timbre into 1–3 parallel lanes. Each lane has its own redstone skeleton; all lanes share one timeline column set and one lever-driven start bus, so pulses advance in sync.
 - **New: `lanes` / `split` / `poly` command parameters** — the default remains the original single-track NBT. `lanes` enables multi-lane output, `split` selects pitch-balanced or timbre-bank assignment, and `poly` caps per-lane same-column polyphony (1–128, default 20).
 - **New: unified building material** — all structural support/strip-gap blocks now use `minecraft:smooth_quartz`; only the instrument pads directly under note blocks (`dirt` / `bamboo_planks` / `gold_block`) and the functionally required `glowstone` in folded layouts are preserved.
+- **New: C++17 fast toolchain** — `midi_to_nbt`, `arrange_multilane`, and `merge_midis` were rewritten from Python/PyInstaller in C++17. Output matches the originals, speedups are about 53×–145×, and the mod JAR is about 54 MB smaller.
+- **New: NTB → NBS export** — the standalone C++ tool `ntb_to_nbs.exe` converts a generated structure into a Note Block Studio `.nbs` file (v4, 20 TPS) for inspection, editing, and sharing.
 
 ## Pipeline
 
@@ -109,32 +113,32 @@ Minecraft Structure NBT
 The project is split into the following independent Windows tools:
 
 1. `audio_to_midi.exe`
-   - Implemented in C++17.
-   - Loads `nmp.onnx` through the ONNX Runtime C++ API.
-   - Uses FFmpeg to decode MP3/WAV into 22050 Hz mono PCM.
-   - Writes Standard MIDI.
+   - A Python conversion pipeline (basic_pitch + onnxruntime) packaged as a standalone executable with PyInstaller.
+   - Uses FFmpeg to decode MP3/WAV into 22050 Hz mono PCM and writes Standard MIDI.
+   - A C++ ONNX reference implementation is also kept under `tools/some-onnx/cpp/` and can be built with `build_win.ps1`.
 
-2. `midi_to_nbt.exe`
-   - Packages the Python generator into a standalone executable with PyInstaller.
-   - Reads MIDI and writes Minecraft Structure NBT.
-   - Preserves note quantization, layout, sustain, and structure validation logic.
+2. `midi_to_nbt.exe` (C++17, rewritten 2026-11-06)
+   - Reads MIDI and writes Minecraft Structure NBT; supports folded/simple layouts, sustain, and per-track instruments.
+   - Source: `tools/some-onnx/cpp/fast_tools/`; the runtime file is the C++ build.
+   - Block-for-block identical to the old Python version, about 108× faster.
 
-3. `demucs_mt.cpp.main.exe` (new)
-   - AI source-separation engine (Demucs htdemucs, 4 stems: drums / bass / other / vocals).
-   - Multi-threaded, CPU-only C++ inference, paired with the `ggml-model-htdemucs-4s-f16.bin` weights.
+3. `merge_midis.exe` (C++17, rewritten 2026-11-06)
+   - Merges multiple stem MIDIs into one MIDI (one channel per source, off-before-on at the same tick).
+   - Note events are identical to the old version, about 145× faster.
 
-4. `traditional_sep.exe` (new)
-   - Traditional source separation (C++17 + Eigen, CPU-only).
-   - Flow: STFT → REPET-SIM (vocals/accompaniment, non-local median filtering + Wiener soft masking) → HPSS (percussive/harmonic) → harmonic band splitting (bass <250Hz / guitar 250–1000Hz / piano >1kHz / other = remainder).
-   - Fixed 6-class output: drums / bass / other / vocals / guitar / piano; hardcoded to 7 physical threads.
+4. `arrange_multilane.exe` (C++17, rewritten 2026-11-06)
+   - Optional multi-lane generator: splits notes by `split`, caps same-column polyphony by `poly`, and emits 1–3 parallel straight lanes.
+   - All lanes share one timeline skeleton and a single lever-driven start bus; block-for-block identical to the old version, about 53× faster.
 
-5. `merge_midis.exe` (new)
-   - Merges multiple stem MIDIs into one MIDI (each source is assigned its own channel to avoid same-pitch cross-track overwrite and head-to-tail pairing errors).
+5. `demucs_mt.cpp.main.exe`
+   - AI source separation (Demucs htdemucs, 4 stems), multi-threaded CPU C++ inference plus model weights.
 
-6. `arrange_multilane.exe` (new)
-   - Optional multi-lane structure generator: reads the final MIDI, splits notes by `split`, caps same-column polyphony by `poly`, and emits N parallel straight lanes.
-   - All lanes share one timeline skeleton, so notes in the same column align in X; a single 0-delay start bus drives every lane, so one lever starts them together.
-   - Disabled by default; it replaces `midi_to_nbt.exe` only when the command includes `lanes`.
+6. `traditional_sep.exe`
+   - Traditional separation (C++17 + Eigen, 6 stems, 7 threads).
+
+7. `ntb_to_nbs.exe` (standalone, added 2026-11-06, not bundled in the mod)
+   - NTB → Note Block Studio `.nbs` (v4, 20 TPS).
+   - Source: `tools/some-onnx/cpp/ntb_to_nbs/`; NBS keys use absolute pitch (0=A0; harp 33–57, bass 9–33, bell 57–81).
 
 The mod calls these executables with `ProcessBuilder`, without JNI. Audio inference, source separation, and NBT generation are therefore decoupled from the Minecraft JVM, making the pipeline easier to test, replace, and extend.
 
@@ -252,6 +256,25 @@ Canon 30s / multi-lane verification (2026-10-31):
 - Smooth-quartz check: 3324 `smooth_quartz` support blocks, only 320 `dirt` blocks and all directly under note blocks; bass/bell pads (`bamboo_planks` / `gold_block`) are unchanged.
 - Debug structures: `canon_roles_straight.nbt` (role-split single-track) and `canon_multilane.nbt` (3 lanes).
 
+C++ rewrite equivalence and speedups (2026-11-06):
+
+| Case | Old (Python) | C++ | Result |
+| --- | --- | --- | --- |
+| `midi_to_nbt` folded | 2345 blocks / 187 notes | same | PASS |
+| `midi_to_nbt` simple | 2044 blocks / 187 notes | same | PASS |
+| `--sustain` | 6147 blocks / 584 notes | same | PASS |
+| `arrange_multilane` 3 lanes | 7534 blocks / 445 notes | same | PASS |
+| `merge_midis` 4 stems | 589 note events | same | PASS |
+| Full chain merge → midi_to_nbt | 4406 blocks | same | PASS |
+
+| Tool | Old median | C++ median | Speedup |
+| --- | ---: | ---: | ---: |
+| `midi_to_nbt` | 1413.1 ms | 13.1 ms | **107.9×** |
+| `arrange_multilane` | 1948.8 ms | 36.7 ms | **53.1×** |
+| `merge_midis` | 823.8 ms | 5.7 ms | **144.5×** |
+
+Timings include the old PyInstaller startup cost; results vary by machine. A re-test of `midi_to_nbt` measured about 1.49–1.70 s → 17.1–17.6 ms.
+
 The tests cover:
 
 - Audio decoding and model inference.
@@ -297,50 +320,86 @@ This is more than putting an existing player inside the game. It changes how red
 
 ## Build Requirements
 
-> **Update**: Added the C++ build for the traditional separation tool (MSVC + CMake/Ninja; Eigen is header-only and shipped with the repo). Traditional separation no longer uses PyInstaller packaging.
+> **Update (2026-11-06)**: Added the full clone-to-build flow. `midi_to_nbt` / `arrange_multilane` / `merge_midis` now build as C++17 and no longer use PyInstaller; runtime binaries are managed with Git LFS.
 
-- Windows 10/11
-- Java 17
-- Minecraft 1.20.1
-- Forge 47.4.16
-- Visual Studio 2022 C++ toolchain
-- CMake and Ninja
-- Python 3.x
-- PyInstaller
-- ONNX Runtime Windows x64 C++ SDK 1.29.0
+### Prerequisites
 
-### Build the C++ Audio Tool
+| Dependency | Purpose | Requirement |
+| --- | --- | --- |
+| Windows 10/11 x64 | Run and build | — |
+| JDK 17 | Forge mod | 17 |
+| Git + Git LFS | Fetch runtime EXEs/DLLs | recent version |
+| Visual Studio 2022 C++ toolchain | C++ tools | MSVC v143 / x64 |
+| CMake + Ninja | C++ tools | CMake 3.16+ |
+| Python 3.x + PyInstaller | Rebuild `audio_to_midi.exe` only | 3.9+ |
+| ONNX Runtime Windows x64 C++ SDK 1.29.0 | Rebuild C++ `audio_to_midi` reference only | 1.29.0 |
+
+Target runtime: Minecraft 1.20.1 + Forge 47.4.16 (Forge dependencies are resolved by Gradle).
+
+### Clone to Build (Mod)
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File tools\some-onnx\cpp\build_win.ps1 `
-  -OrtRoot "E:\path\to\onnxruntime-win-x64-1.29.0"
+git clone https://github.com/honghax/AutoRedStoneMusic.git RedStoneMusic-local
+cd RedStoneMusic-local
+git lfs install
+git lfs pull
+.\gradlew.bat build --no-daemon
 ```
 
-The output is written to the ignored `tools/some-onnx/cpp-build/` directory. The build script searches for CMake, Ninja, and MSVC and removes stale CMake configuration before rebuilding.
+- `tools/some-onnx/runtime/` already contains the runtime EXEs/DLLs (Git LFS); `processResources` copies them into `redstonemusic/tools/` inside the JAR.
+- **After a successful LFS pull, no tool rebuild is required to build the mod.**
+- Output: `build/libs/redstone_music-*.jar`.
+- Without `git lfs pull`, the cloned EXEs/DLLs are pointer files: the mod still builds, but fails at runtime.
 
-### Build the Traditional Separation Tool (C++)
+### Rebuild the Fast C++ Tools (Optional)
 
-`tools/some-onnx/cpp/traditional_sep/` is a standalone CMake project that depends on the header-only Eigen shipped alongside it (`tools/some-onnx/cpp/eigen`):
+The sources for `midi_to_nbt`, `arrange_multilane`, and `merge_midis` are in `tools/some-onnx/cpp/fast_tools/`:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tools\some-onnx\cpp\fast_tools\build.ps1
+```
+
+The script finds CMake/Ninja/MSVC automatically and writes to `tools/some-onnx/cpp/fast_tools/build/`. To replace the runtime files:
+
+```powershell
+Copy-Item tools\some-onnx\cpp\fast_tools\build\fast_midi_to_nbt.exe tools\some-onnx\runtime\midi_to_nbt.exe -Force
+Copy-Item tools\some-onnx\cpp\fast_tools\build\fast_arrange_multilane.exe tools\some-onnx\runtime\arrange_multilane.exe -Force
+Copy-Item tools\some-onnx\cpp\fast_tools\build\fast_merge_midis.exe tools\some-onnx\runtime\merge_midis.exe -Force
+```
+
+### Rebuild the Traditional Separation Tool (C++)
+
+`tools/some-onnx/cpp/traditional_sep/` is a standalone CMake project that depends on the header-only Eigen shipped alongside it:
 
 ```powershell
 cmake -S tools\some-onnx\cpp\traditional_sep -B tools\some-onnx\cpp-build\traditional_sep -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build tools\some-onnx\cpp-build\traditional_sep
 ```
 
-### Build the Python Tools
-
-Use a Python environment containing `basic_pitch`, `pretty_midi`, `mido`, `nbtlib`, and PyInstaller:
+### Build NTB → NBS (C++, Optional)
 
 ```powershell
-python -m PyInstaller --clean --noconfirm `
-  tools\some-onnx\packaging\audio_to_midi.spec
-
-python -m PyInstaller --clean --noconfirm `
-  tools\some-onnx\packaging\midi_to_nbt.spec
-
-python -m PyInstaller --clean --noconfirm `
-  tools\some-onnx\packaging\arrange_multilane.spec
+cmake -S tools\some-onnx\cpp\ntb_to_nbs -B tools\some-onnx\cpp-build\ntb_to_nbs -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build tools\some-onnx\cpp-build\ntb_to_nbs
 ```
+
+Output: `tools/some-onnx/cpp-build/ntb_to_nbs/ntb_to_nbs.exe`. It is standalone and is not copied into the runtime.
+
+> If CMake/Ninja are not on PATH, run from a Visual Studio Developer PowerShell; `fast_tools/build.ps1` finds them automatically.
+
+### Rebuild audio_to_midi (PyInstaller)
+
+Use a Python environment containing `basic_pitch`, `pretty_midi`, `mido`, `soundfile`, `librosa`, `resampy`, `soxr`, `onnxruntime`, and PyInstaller:
+
+```powershell
+python -m PyInstaller --clean --noconfirm tools\some-onnx\packaging\audio_to_midi.spec
+```
+
+The output is `dist/audio_to_midi.exe`; copy it to `tools/some-onnx/runtime/audio_to_midi.exe`.
+
+> The C++ ONNX reference implementation can be built with `powershell -ExecutionPolicy Bypass -File tools\some-onnx\cpp\build_win.ps1 -OrtRoot "E:\path\to\onnxruntime-win-x64-1.29.0"`; the current runtime uses the PyInstaller build above.
+>
+> `midi_to_nbt.spec`, `arrange_multilane.spec`, and `merge_midis.spec` are legacy PyInstaller specs superseded by the C++ tools; do not use them to overwrite the current runtime.
 
 ### Build the Forge Mod
 
@@ -348,10 +407,12 @@ python -m PyInstaller --clean --noconfirm `
 .\gradlew.bat build --no-daemon
 ```
 
-The final mod JAR is written to `build/libs/`. Runtime tools are packaged under `redstonemusic/tools/` inside the JAR.
+The final JAR is written to `build/libs/`; runtime resources are packaged under `redstonemusic/tools/` inside the JAR.
 
 ## Project Layout
 
+> **Update (2026-11-06)**: Added `cpp/fast_tools/` (C++17 `midi_to_nbt` / `arrange_multilane` / `merge_midis`) and `cpp/ntb_to_nbs/` (NTB → NBS).
+>
 > **Update (2026-10-31)**: Added `src/arrange_multilane.py` (final MIDI → multi-lane straight), `src/arrange_straight.py` (multi-role → single straight), `src/eval_ntb_loss.py` (loss quantification), `packaging/arrange_multilane.spec`, and debug structures `canon_roles_straight.nbt` / `canon_multilane.nbt`.
 >
 > **Update (2026-10-11)**: Added `cpp/traditional_sep/` (C++ traditional separation), `cpp/eigen/` (Eigen headers), `src/merge_midis.py` (MIDI merge), `src/traditional_separate.py` (Python reference implementation), and `MultiTrackNbtMerger.java`.
@@ -362,6 +423,8 @@ src/main/resources/                Mod metadata and runtime resources
  tools/some-onnx/cpp/               C++ inference source and build scripts
  tools/some-onnx/cpp/traditional_sep/   C++ traditional source separation
  tools/some-onnx/cpp/eigen/         Header-only Eigen library
+ tools/some-onnx/cpp/fast_tools/    C++17 fast tools (midi_to_nbt / arrange_multilane / merge_midis)
+ tools/some-onnx/cpp/ntb_to_nbs/    NTB → NBS converter
  tools/some-onnx/src/               MIDI, NBT, and Python helper source
  tools/some-onnx/src/arrange_multilane.py   Final MIDI → multi-lane straight structure
  tools/some-onnx/src/arrange_straight.py    Multi-role MIDI → single straight structure
