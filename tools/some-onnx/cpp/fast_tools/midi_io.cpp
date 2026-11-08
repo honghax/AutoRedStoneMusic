@@ -164,6 +164,9 @@ bool readMidiFile(const std::string& path, MidiFileData& out, std::string& error
                         ev.note = data1;
                         ev.velocity = 0;
                     }
+                } else if (hi == 0xC) {
+                    ev.kind = EvKind::ProgramChange;
+                    ev.program = data1;
                 } else {
                     ev.kind = EvKind::Other;
                 }
@@ -187,6 +190,11 @@ bool readMidiFile(const std::string& path, MidiFileData& out, std::string& error
                     ev.tempo = (static_cast<int>(bytes[r.pos]) << 16) |
                                (static_cast<int>(bytes[r.pos + 1]) << 8) |
                                static_cast<int>(bytes[r.pos + 2]);
+                } else if (meta_type == 0x03) {
+                    track.name.assign(bytes.begin() + static_cast<std::ptrdiff_t>(r.pos),
+                                      bytes.begin() + static_cast<std::ptrdiff_t>(r.pos) +
+                                          static_cast<std::ptrdiff_t>(meta_len));
+                    ev.kind = EvKind::Other;
                 } else {
                     ev.kind = EvKind::Other;
                 }
@@ -242,6 +250,9 @@ bool readMidiFile(const std::string& path, MidiFileData& out, std::string& error
                         ev.note = d1;
                         ev.velocity = 0;
                     }
+                } else if (hi == 0xC) {
+                    ev.kind = EvKind::ProgramChange;
+                    ev.program = d1;
                 } else {
                     ev.kind = EvKind::Other;
                 }

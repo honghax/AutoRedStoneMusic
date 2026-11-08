@@ -4,6 +4,8 @@
 
 AutoRedStoneMusic 的目标，是把一首歌曲从普通音频文件直接变成可以在 Minecraft 世界中放置、播放和分享的红石音乐结构。用户只需要把 MP3 或 WAV 放入指定目录，即可在游戏内调用转换工具，生成 `.nbt` 结构并放置到玩家面前。
 
+> **本次更新（2026-11-08）**：新增**在线多乐器转写**（可选联网）。`Convert <歌名> online` 会把音频交给公开部署的在线模型转写，得到带乐器信息的 MIDI，再直接生成**按乐器分轨的多轨结构**（轨道数 = 乐器数）。执行命令后聊天栏会先询问是否允许上传，点「是」才开始；该分支固定参数、不接受其它命令参数，转换完成自动放置。
+
 > **本次更新（2026-11-06）**：`midi_to_nbt.exe`、`arrange_multilane.exe`、`merge_midis.exe` 已由 Python/PyInstaller **重写为 C++17**，逐方块/逐音符输出与旧版一致；实测提速约 **108× / 53× / 145×**，模组 JAR 因此缩小约 **54 MB**。新增独立的 **NTB → NBS（Note Block Studio）** 导出工具。README 补充了从克隆仓库到构建模组的完整步骤（含 Git LFS）。
 
 > **本次更新（2026-10-31）**：新增**多轨直排结构**——在“最终 MIDI → NBT”阶段按音高/音色拆成 1~3 条并行红石轨道，所有轨道共享同一条时间轴骨架与单一拉杆起始总线，脉冲同步前进；`Convert` 新增 `lanes <N>`、`split pitch|bank`、`poly 1..128` 参数，默认仍走原版单轨 NBT；所有结构支撑方块统一替换为**平滑石英**（保留音符盒正下方的乐器垫块）；新增独立工具 `arrange_multilane.py`、`arrange_straight.py`、`eval_ntb_loss.py` 与两个调试结构。
@@ -34,6 +36,7 @@ AutoRedStoneMusic 的目标，是把一首歌曲从普通音频文件直接变�
 - **新增：统一建筑材质**——所有结构支撑/条带间隔方块改为 `minecraft:smooth_quartz`，仅保留音符盒正下方的乐器垫块（`dirt` / `bamboo_planks` / `gold_block`）以及折叠布局中功能性必需的 `glowstone`。
 - **新增：C++17 快速工具链**——`midi_to_nbt` / `arrange_multilane` / `merge_midis` 已从 Python/PyInstaller 重写为 C++17，输出与原版一致，速度提升约 53×~145×，模组 JAR 缩小约 54 MB。
 - **新增：NTB → NBS 导出**——独立 C++ 工具 `ntb_to_nbs.exe` 可把已生成的红石结构转换为 Note Block Studio 的 `.nbs`（v4，20 TPS），便于在 NBS 中查看、编辑和二次分享。
+- **新增：在线多乐器转写（可选联网）**——`Convert <歌名> online` 使用公开部署的在线模型完成多乐器转写，不需要本机运行推理模型；结果直接生成按乐器分轨的多轨结构（`bass / harp / bell / basedrum`，轨道数 = 实际出现的乐器数）。上传前需在聊天栏点「是」确认，点「否」不会上传任何文件。
 
 ## 工作流程
 
@@ -110,6 +113,30 @@ N 条平行直排红石轨道（各自 repeater + 支线 + 音符盒）
 Minecraft Structure NBT
 ```
 
+在线多乐器（2026-11-08 新增，可选，需要联网）：
+
+```text
+MP3/WAV
+   |
+   v
+玩家确认允许上传
+   |
+   v
+公开部署的在线模型（多乐器转写）
+   |
+   v
+多乐器 MIDI（每件乐器保留独立的轨道 / program 信息）
+   |
+   v
+arrange_multilane.exe --split instrument
+   ├─ 按乐器分轨：bass / harp / bell / basedrum
+   ├─ 轨道数 = 乐器数
+   └─ 超出共享总线距离时：bell 并入 harp
+   |
+   v
+共享起始总线 + Minecraft Structure NBT（自动放置）
+```
+
 项目由以下独立的 Windows 工具组成：
 
 1. `audio_to_midi.exe`
@@ -140,7 +167,12 @@ Minecraft Structure NBT
    - NTB → Note Block Studio `.nbs`（v4，20 TPS）。
    - 源码在 `tools/some-onnx/cpp/ntb_to_nbs/`；按乐器基准音高映射 NBS key（0=A0，harp 33~57、bass 9~33、bell 57~81）。
 
-模组通过 `ProcessBuilder` 调用这些 EXE，不使用 JNI，因此音频推理、音源分离和 NBT 生成与 Minecraft JVM 解耦，便于调试、替换和独立测试。
+8. 在线转写客户端（2026-11-08 新增，模组内置 Java 实现）
+   - 直接向公开部署的在线模型提交音频，读取转写完成的多乐器 MIDI，再交给 `arrange_multilane.exe --split instrument` 生成多轨结构。
+   - 不占用本机推理 CPU / 显存，但需要联网；不含本地回退，在线服务不可用时转换失败。
+   - 服务地址集中在源码的在线转写客户端中，可按需替换为其它公开部署的在线服务。
+
+模组通过 `ProcessBuilder` 调用这些 EXE，不使用 JNI，因此音频推理、音源分离和 NBT 生成与 Minecraft JVM 解耦，便于调试、替换和独立测试。在线转写是唯一的联网链路，且必须先经玩家在聊天栏确认。
 
 ## 游戏内目录
 
@@ -177,6 +209,8 @@ redstonemusic/tools/
 
 ## 游戏内命令
 
+> **本次更新（2026-11-08）**：`Convert` 新增 `online` 分支：`Convert <歌名> online`。该分支不接受其它命令参数；执行后先在聊天栏询问是否允许上传音频，点「是」才联网转写，随后按乐器分轨并自动放置。生成文件名为 `<原名>_online_multi.ntb`。
+
 > **本次更新（2026-10-31）**：`Convert` 新增 `lanes <N>`、`split pitch|bank`、`poly 1..128` 语法节点；默认不写 `lanes` 时仍走原版单轨 NBT；生成文件名追加 `_L<N>[_bank][_P<cap>]` 签名。
 >
 > **本次更新（2026-10-11）**：`Convert` 增加引擎与多轨语法节点（`ai`/`trad`、`true`/`false`），`true`/`false` 作为命令语法组成而非字符串参数；新增 `debug place <structure>` 内置结构放置；生成文件名加入引擎与多轨签名。
@@ -199,6 +233,7 @@ redstonemusic/tools/
 /RedStoneMusic Convert song.mp3 lanes 3 split bank poly 8
 /RedStoneMusic Convert song.mp3 true lanes 3 poly 8
 /RedStoneMusic Convert song.mp3 trad true lanes 3 split bank poly 12
+/RedStoneMusic Convert song.mp3 online
 /RedStoneMusic place song.ntb
 /RedStoneMusic debug place <structure>
 ```
@@ -221,8 +256,9 @@ redstonemusic/tools/
 - `Convert song.mp3 lanes 3 split bank`：按 `bass / harp / bell` 音色分轨，而不是按音高均衡分轨。
 - `Convert song.mp3 true lanes 3 ...`：先做 AI 多音轨分离，再把合并后的最终 MIDI 生成 3 轨结构。
 - `Convert song.mp3 trad true lanes 3 ...`：传统分离 + 3 轨结构。
+- `Convert song.mp3 online`：使用公开部署的在线模型做**多乐器转写**，生成**按乐器分轨的多轨结构**（轨道数 = 乐器数，`bass / harp / bell / basedrum`），完成后自动放置。该命令不接受其它参数；执行后聊天栏会弹出「是 / 否」确认，只有点「是」才会上传音频。需要联网，且不含本地回退。
 
-生成文件名为 `<原名>_<引擎>_<是否多轨>[_L<N>][_bank][_P<cap>].ntb`，例如：单轨 AI 转换 `a_ai_false.ntb`、传统多轨转换 `a_trad_true.ntb`、3 轨 pitch/poly20 `a_ai_false_L3.ntb`、3 轨 bank/poly8 `a_ai_false_L3_bank_P8.ntb`。输入文件只允许使用配置目录下的单个文件名，模组会检查扩展名并阻止路径穿越。
+生成文件名为 `<原名>_<引擎>_<是否多轨>[_L<N>][_bank][_P<cap>].ntb`，例如：单轨 AI 转换 `a_ai_false.ntb`、传统多轨转换 `a_trad_true.ntb`、3 轨 pitch/poly20 `a_ai_false_L3.ntb`、3 轨 bank/poly8 `a_ai_false_L3_bank_P8.ntb`。在线转换输出 `<原名>_online_multi.ntb`。输入文件只允许使用配置目录下的单个文件名，模组会检查扩展名并阻止路径穿越。
 
 ## 测试结果
 
@@ -454,6 +490,14 @@ src/main/resources/                模组元数据和运行时工具资源
 - 中间 MIDI、分离音轨和任务目录在该转换任务结束时删除；这不是对最终 NBT 的删除。临时工具、模型和 DLL 留在工具工作目录中，以便退出当前存档后仍可继续使用；Minecraft/JVM 正常关闭时由 shutdown hook 尝试清理。
 - 清理是尽力而为：若进程崩溃、系统断电或文件被占用，临时文件可能残留。管理员可在确认 Minecraft 已关闭后检查并删除名称以 `RedStoneMusic-` 开头的本模组临时目录。
 - 模组记录命令和工具输出日志。不要把含有敏感内容的私人音频放入服务器；工具日志也应按服务器日志策略保护。
+
+### 在线转写（可选联网）
+
+- 只有玩家执行 `Convert <文件> online` 并在聊天栏点「是」后，所选音频才会被上传到一个**不受中国境内监管的第三方在线服务**。
+- 上传内容仅为所选音频文件本身，不包含世界存档、玩家信息或其它目录中的文件。
+- 该链路不启动本地推理 EXE；在线服务不可用或排队时会失败并提示，重试次数有限（最多 12 次、每次间隔 5 秒）。
+- 服务地址集中在源码的在线转写客户端中，便于服务器管理员或整合包作者替换为其它公开部署的在线服务；本文档不固定具体服务地址。
+- 若音频涉及隐私或不宜外传，请勿使用 `online` 命令；本地 `Convert`、`true`、`trad` 链路完全在主机内完成，不产生网络上传。
 
 ### CPU 峰值和并发
 

@@ -11,6 +11,8 @@ import net.minecraft.core.Vec3i;
 import net.minecraft.core.registries.Registries;
 import net.minecraft.nbt.CompoundTag;
 import net.minecraft.nbt.NbtIo;
+import net.minecraft.ChatFormatting;
+import net.minecraft.network.chat.ClickEvent;
 import net.minecraft.network.chat.Component;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraft.server.level.ServerLevel;
@@ -36,7 +38,11 @@ import java.nio.file.Path;
 import java.util.Locale;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
+import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.Consumer;
 
 @Mod(RedStoneMusic.MODID)
 public class RedStoneMusic {
@@ -44,6 +50,12 @@ public class RedStoneMusic {
     public static final Logger LOGGER = LogUtils.getLogger();
     private static MusicStorage storage;
     private static MusicToolRunner toolRunner;
+
+    // 在线转写前的上传确认：token → (文件, 玩家, 过期时刻)；只保留短时间，避免误触
+    private static final Map<String, PendingOnline> PENDING_ONLINE = new ConcurrentHashMap<>();
+    private static final long ONLINE_CONFIRM_TTL_MS = 120000L;
+
+    private record PendingOnline(Path input, UUID player, long expiresAt) {}
 
     public RedStoneMusic(FMLJavaModLoadingContext context) {
         IEventBus modEventBus = context.getModEventBus();
@@ -69,6 +81,7 @@ public class RedStoneMusic {
                     .then(Commands.literal("mp3").executes(context -> listFiles(context, "mp3")))
                     .then(Commands.literal("ntb").executes(context -> listFiles(context, "ntb"))))
                 .then(convertCommand("Convert"))
+                .then(onlineConfirmNode())
                 .then(Commands.literal("place")
                     .then(Commands.argument("file", StringArgumentType.word())
                         .executes(context -> placeExternal(context, StringArgumentType.getString(context, "file")))))
@@ -83,6 +96,7 @@ public class RedStoneMusic {
                     .then(Commands.literal("mp3").executes(context -> listFiles(context, "mp3")))
                     .then(Commands.literal("ntb").executes(context -> listFiles(context, "ntb"))))
                 .then(convertCommand("convert"))
+                .then(onlineConfirmNode())
                 .then(Commands.literal("place")
                     .then(Commands.argument("file", StringArgumentType.word())
                         .executes(context -> placeExternal(context, StringArgumentType.getString(context, "file")))))
@@ -98,6 +112,8 @@ public class RedStoneMusic {
         return Commands.literal(literal)
             .then(Commands.argument("file", StringArgumentType.word())
                 .executes(context -> convert(context, getFile(context), "ai", false, true))
+                .then(Commands.literal("online")
+                    .executes(context -> convertOnline(context, getFile(context))))
                 .then(lanesNode("ai", false, true))
                 .then(Commands.literal("to")
                     .then(Commands.literal("ntb").executes(context -> convert(context, getFile(context), "ai", false, false))))
@@ -271,6 +287,118 @@ public class RedStoneMusic {
         } catch (Exception e) {
             return fail(context, "转换失败: " + e.getMessage(), e);
         }
+    }
+
+    // 隐藏分支：聊天栏点「是 / 否」时回传 token（2 分钟内有效）
+    private static com.mojang.brigadier.builder.LiteralArgumentBuilder<CommandSourceStack> onlineConfirmNode() {
+        return Commands.literal("online")
+            .then(Commands.literal("confirm")
+                .then(Commands.argument("token", StringArgumentType.word())
+                    .executes(context -> confirmOnline(context, StringArgumentType.getString(context, "token")))))
+            .then(Commands.literal("cancel")
+                .then(Commands.argument("token", StringArgumentType.word())
+                    .executes(context -> cancelOnline(context, StringArgumentType.getString(context, "token")))));
+    }
+
+    // Convert <file> online —— 先询问是否允许上传；点「是」后才联网。固定参数、默认多轨
+    private static int convertOnline(CommandContext<CommandSourceStack> context, String file) {
+        if (!ready(context)) return 0;
+        try {
+            Path input = storage.resolveMp3(file);
+            if (!Files.isRegularFile(input)) throw new IOException("mp3 文件不存在: " + file);
+            UUID playerId;
+            try {
+                playerId = context.getSource().getPlayerOrException().getUUID();
+            } catch (Exception e) {
+                throw new IOException("该命令需要玩家执行");
+            }
+            long now = System.currentTimeMillis();
+            PENDING_ONLINE.entrySet().removeIf(entry -> now > entry.getValue().expiresAt());
+            String token = UUID.randomUUID().toString();
+            PENDING_ONLINE.put(token, new PendingOnline(input, playerId, now + ONLINE_CONFIRM_TTL_MS));
+
+            context.getSource().sendSuccess(() -> Component.literal(
+                "是否允许把音频文件「" + input.getFileName() + "」上传至不受中国境内监管的网站？"), false);
+            Component yes = Component.literal("[是]").withStyle(style -> style
+                .withColor(ChatFormatting.GREEN)
+                .withClickEvent(new ClickEvent(ClickEvent.Action.RUN_COMMAND,
+                    "/redstonemusic online confirm " + token)));
+            Component no = Component.literal("[否]").withStyle(style -> style
+                .withColor(ChatFormatting.RED)
+                .withClickEvent(new ClickEvent(ClickEvent.Action.RUN_COMMAND,
+                    "/redstonemusic online cancel " + token)));
+            context.getSource().sendSuccess(() -> Component.empty().append(yes).append(" ").append(no), false);
+            return 1;
+        } catch (Exception e) {
+            return fail(context, "在线转换失败: " + e.getMessage(), e);
+        }
+    }
+
+    private static int confirmOnline(CommandContext<CommandSourceStack> context, String token) {
+        if (!ready(context)) return 0;
+        PendingOnline pending = PENDING_ONLINE.get(token);
+        if (pending == null || System.currentTimeMillis() > pending.expiresAt()) {
+            PENDING_ONLINE.remove(token);
+            return fail(context, "确认已失效，请重新输入在线转换命令", null);
+        }
+        try {
+            ServerPlayer player = context.getSource().getPlayerOrException();
+            if (!player.getUUID().equals(pending.player())) {
+                return fail(context, "只能由发起命令的玩家确认", null);
+            }
+        } catch (Exception e) {
+            return fail(context, "该命令需要玩家执行", e);
+        }
+        PENDING_ONLINE.remove(token);
+        return startOnline(context, pending.input());
+    }
+
+    private static int cancelOnline(CommandContext<CommandSourceStack> context, String token) {
+        PENDING_ONLINE.remove(token);
+        context.getSource().sendSuccess(
+            () -> Component.literal("已取消在线转写，未上传任何文件"), false);
+        return 1;
+    }
+
+    private static int startOnline(CommandContext<CommandSourceStack> context, Path input) {
+        String base = stripExtension(input.getFileName().toString());
+        Path output = storage.ntbDirectory().resolve(base + "_online_multi.ntb");
+        context.getSource().sendSuccess(
+            () -> Component.literal("开始在线多乐器转写: " + input.getFileName()), false);
+        Consumer<String> progress = message -> {
+            try {
+                ServerPlayer player = context.getSource().getPlayerOrException();
+                player.server.execute(() -> context.getSource().sendSuccess(
+                    () -> Component.literal(message), false));
+            } catch (Exception ignored) {
+                // 玩家已下线，忽略进度提示
+            }
+        };
+        Path finalInput = input;
+        toolRunner.convertOnlineAsync(finalInput, output, progress).whenComplete((result, error) -> {
+            ServerPlayer player;
+            try {
+                player = context.getSource().getPlayerOrException();
+            } catch (Exception e) {
+                LOGGER.error("ONLINE 完成后找不到玩家", e);
+                return;
+            }
+            player.server.execute(() -> {
+                if (error != null) {
+                    LOGGER.error("ONLINE 失败: {}", finalInput, error);
+                    context.getSource().sendFailure(
+                        Component.literal("在线转换失败: " + rootMessage(error)));
+                    return;
+                }
+                LOGGER.info("ONLINE 完成: {}", result);
+                context.getSource().sendSuccess(
+                    () -> Component.literal("在线多轨转换完成: " + result.getFileName()), false);
+                context.getSource().sendSuccess(
+                    () -> Component.literal("正在放置结构..."), false);
+                placeFile(context, result);
+            });
+        });
+        return 1;
     }
 
     private static int multiConvert(CommandContext<CommandSourceStack> context, Path input,

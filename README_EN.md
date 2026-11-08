@@ -4,6 +4,8 @@ A Forge mod and local toolchain that converts ordinary audio into playable Minec
 
 AutoRedStoneMusic takes an MP3 or WAV file and turns it into a Minecraft Structure NBT file containing note blocks and redstone timing. The generated structure can be saved, shared, loaded again, and placed directly in front of the player from inside Minecraft.
 
+> **Update (2026-11-08)**: Added **optional online multi-instrument transcription**. `Convert <song> online` sends the audio to a publicly deployed online model, receives an instrument-tagged MIDI, and generates an **instrument-per-lane structure** (lane count = number of instruments). A Yes/No confirmation appears in chat first; the command branch takes no extra parameters and places the structure automatically when finished.
+
 > **Update (2026-11-06)**: `midi_to_nbt.exe`, `arrange_multilane.exe`, and `merge_midis.exe` were **rewritten in C++17** from Python/PyInstaller. Their block/note output matches the originals exactly, with measured speedups of about **108× / 53× / 145×** and a **~54 MB** smaller mod JAR. Added a standalone **NTB → NBS (Note Block Studio)** exporter. The README now documents the full clone-to-build flow, including Git LFS.
 
 > **Update (2026-10-31)**: Added **multi-lane straight structures** — at the "final MIDI → NBT" stage, notes are split into 1–3 parallel redstone lanes. All lanes share one timeline skeleton and one lever-driven start bus, so their pulses march in sync. `Convert` gained `lanes <N>`, `split pitch|bank`, and `poly 1..128`; omitting `lanes` keeps the original single-track NBT path. All structural support blocks now use **smooth quartz** (instrument pads directly under note blocks are preserved). Added standalone tools `arrange_multilane.py`, `arrange_straight.py`, `eval_ntb_loss.py`, and two debug structures.
@@ -34,6 +36,7 @@ AutoRedStoneMusic takes an MP3 or WAV file and turns it into a Minecraft Structu
 - **New: unified building material** — all structural support/strip-gap blocks now use `minecraft:smooth_quartz`; only the instrument pads directly under note blocks (`dirt` / `bamboo_planks` / `gold_block`) and the functionally required `glowstone` in folded layouts are preserved.
 - **New: C++17 fast toolchain** — `midi_to_nbt`, `arrange_multilane`, and `merge_midis` were rewritten from Python/PyInstaller in C++17. Output matches the originals, speedups are about 53×–145×, and the mod JAR is about 54 MB smaller.
 - **New: NTB → NBS export** — the standalone C++ tool `ntb_to_nbs.exe` converts a generated structure into a Note Block Studio `.nbs` file (v4, 20 TPS) for inspection, editing, and sharing.
+- **New: optional online multi-instrument transcription** — `Convert <song> online` uses a publicly deployed online model, so no local inference model is needed. The result becomes an instrument-per-lane structure (`bass / harp / bell / basedrum`, lane count = number of instruments present). Uploading requires a Yes/No confirmation in chat; choosing No uploads nothing.
 
 ## Pipeline
 
@@ -110,6 +113,30 @@ Shared start bus (one lever + observer + 0-delay redstone dust)
 Minecraft Structure NBT
 ```
 
+Online multi-instrument (added 2026-11-08, optional, requires network):
+
+```text
+MP3/WAV
+   |
+   v
+Player confirms the upload
+   |
+   v
+Publicly deployed online model (multi-instrument transcription)
+   |
+   v
+Multi-instrument MIDI (each instrument keeps its own track / program)
+   |
+   v
+arrange_multilane.exe --split instrument
+   ├─ Lanes by instrument: bass / harp / bell / basedrum
+   ├─ Lane count = number of instruments
+   └─ If the shared bus would be too long: merge bell into harp
+   |
+   v
+Shared start bus + Minecraft Structure NBT (placed automatically)
+```
+
 The project is split into the following independent Windows tools:
 
 1. `audio_to_midi.exe`
@@ -140,7 +167,12 @@ The project is split into the following independent Windows tools:
    - NTB → Note Block Studio `.nbs` (v4, 20 TPS).
    - Source: `tools/some-onnx/cpp/ntb_to_nbs/`; NBS keys use absolute pitch (0=A0; harp 33–57, bass 9–33, bell 57–81).
 
-The mod calls these executables with `ProcessBuilder`, without JNI. Audio inference, source separation, and NBT generation are therefore decoupled from the Minecraft JVM, making the pipeline easier to test, replace, and extend.
+8. Online transcription client (added 2026-11-08, Java implementation inside the mod)
+   - Submits audio to a publicly deployed online model, reads the returned multi-instrument MIDI, and feeds it to `arrange_multilane.exe --split instrument`.
+   - Uses no local inference CPU/VRAM but requires network access; there is no local fallback, so the conversion fails when the service is unavailable.
+   - The service address lives in the source of the online transcription client and can be replaced with another publicly deployed online service.
+
+The mod calls these executables with `ProcessBuilder`, without JNI. Audio inference, source separation, and NBT generation are therefore decoupled from the Minecraft JVM, making the pipeline easier to test, replace, and extend. Online transcription is the only network path, and it requires explicit player confirmation in chat first.
 
 ## In-Game Directories
 
@@ -177,6 +209,8 @@ This `redstonemusic/tools/` path is created inside the temporary runtime workspa
 
 ## In-Game Commands
 
+> **Update (2026-11-08)**: `Convert` gained an `online` branch: `Convert <song> online`. It takes no other command parameters; it first asks in chat whether uploading the audio is allowed, converts online only after clicking Yes, then builds instrument lanes and places the structure automatically. Output file: `<name>_online_multi.ntb`.
+
 > **Update (2026-10-31)**: `Convert` gained `lanes <N>`, `split pitch|bank`, and `poly 1..128` syntax nodes; omitting `lanes` keeps the original single-track NBT path. Generated file names add `_L<N>[_bank][_P<cap>]`.
 >
 > **Update (2026-10-11)**: `Convert` gained engine and multi-track syntax nodes (`ai`/`trad`, `true`/`false`); `true`/`false` are command-syntax nodes rather than string arguments. A new `debug place <structure>` was added, and generated file names now carry engine and multi-track signatures.
@@ -199,6 +233,7 @@ The commands require permission level 2. Lowercase compatibility commands are al
 /RedStoneMusic Convert song.mp3 lanes 3 split bank poly 8
 /RedStoneMusic Convert song.mp3 true lanes 3 poly 8
 /RedStoneMusic Convert song.mp3 trad true lanes 3 split bank poly 12
+/RedStoneMusic Convert song.mp3 online
 /RedStoneMusic place song.ntb
 /RedStoneMusic debug place <structure>
 ```
@@ -221,8 +256,9 @@ Commands:
 - `Convert song.mp3 lanes 3 split bank`: Assigns lanes by `bass / harp / bell` timbre instead of pitch-balanced splitting.
 - `Convert song.mp3 true lanes 3 ...`: Runs AI separation first, then builds 3 lanes from the merged final MIDI.
 - `Convert song.mp3 trad true lanes 3 ...`: Traditional separation plus 3 lanes.
+- `Convert song.mp3 online`: Uses a publicly deployed online model for **multi-instrument transcription** and produces an **instrument-per-lane structure** (lane count = number of instruments: `bass / harp / bell / basedrum`), then places it automatically. No other parameters are accepted. A Yes/No confirmation appears in chat, and the audio is uploaded only after clicking Yes. Requires network access and has no local fallback.
 
-Generated file names follow `<name>_<engine>_<multi-track>[_L<N>][_bank][_P<cap>].ntb`, e.g. `a_ai_false.ntb` for a single-track AI conversion, `a_trad_true.ntb` for a traditional multi-track conversion, `a_ai_false_L3.ntb` for 3 lanes with pitch/poly20, or `a_ai_false_L3_bank_P8.ntb` for 3 lanes with bank/poly8. Only a single file name inside the configured directory is accepted. The mod validates extensions and rejects path traversal attempts.
+Generated file names follow `<name>_<engine>_<multi-track>[_L<N>][_bank][_P<cap>].ntb`, e.g. `a_ai_false.ntb` for a single-track AI conversion, `a_trad_true.ntb` for a traditional multi-track conversion, `a_ai_false_L3.ntb` for 3 lanes with pitch/poly20, or `a_ai_false_L3_bank_P8.ntb` for 3 lanes with bank/poly8. Online conversion writes `<name>_online_multi.ntb`. Only a single file name inside the configured directory is accepted. The mod validates extensions and rejects path traversal attempts.
 
 ## Test Results
 
@@ -454,6 +490,14 @@ The JAR bundles fixed versions of `audio_to_midi.exe`, `midi_to_nbt.exe`, `arran
 - The intermediate MIDI(s), separated stems, and per-job directory are deleted when that conversion job finishes. The final NBT is not deleted. Runtime tools, model weights, and DLLs remain in the tool working directory so they can be reused after leaving a world; a JVM shutdown hook attempts to remove that directory when Minecraft exits normally.
 - Cleanup is best-effort. A crash, power loss, or locked file can leave temporary files behind. After confirming Minecraft is closed, administrators can inspect and remove this mod's temporary directories whose names start with `RedStoneMusic-`.
 - The mod logs commands and tool output. Do not place sensitive private audio on a server, and protect tool logs according to the server's log-handling policy.
+
+### Online transcription (optional, network)
+
+- Audio is uploaded to a **third-party online service outside PRC jurisdiction** only after a player runs `Convert <file> online` and clicks Yes in chat.
+- The uploaded content is the selected audio file itself; no world data, player information, or other files are included.
+- This path starts no local inference executable. If the online service is unavailable or queued, the conversion fails with a message; retries are limited (at most 12 attempts, 5 seconds apart).
+- The service address lives in the source of the online transcription client so server administrators or modpack authors can point it at another publicly deployed online service; this document does not pin a specific address.
+- Do not use the `online` command for private or sensitive audio. The local `Convert`, `true`, and `trad` paths run entirely on the host and upload nothing.
 
 ### CPU spikes and concurrency
 

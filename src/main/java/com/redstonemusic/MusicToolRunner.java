@@ -14,6 +14,7 @@ import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.function.Consumer;
 
 public final class MusicToolRunner implements AutoCloseable {
     private static final String AUDIO_EXE = "/redstonemusic/tools/audio_to_midi.exe";
@@ -212,6 +213,41 @@ public final class MusicToolRunner implements AutoCloseable {
                 return output;
             } catch (IOException e) {
                 throw new IllegalStateException("多音轨转换失败", e);
+            } finally {
+                deleteTree(jobDirectory);
+            }
+        }, executor);
+    }
+
+    /**
+     * 在线转换：MuScriptor（多乐器转写）→ MIDI → 按乐器拆分的多轨 NBT。
+     *
+     * <p>该链路只使用固定参数（instrument 分轨、resolution 2、lane-gap 2），
+     * 不额外接收命令参数；轨道数由转写结果中的乐器数决定。</p>
+     */
+    public CompletableFuture<Path> convertOnlineAsync(Path input, Path output,
+                                                      Consumer<String> progress) {
+        return CompletableFuture.supplyAsync(() -> {
+            Path jobDirectory;
+            try {
+                jobDirectory = Files.createTempDirectory(workDirectory, "online-");
+            } catch (IOException e) {
+                throw new IllegalStateException("无法创建在线转换临时目录", e);
+            }
+            try {
+                Path midi = jobDirectory.resolve("online.mid");
+                new MuscriptorClient().transcribe(input, midi, progress);
+                run(jobDirectory, List.of(workDirectory.resolve("arrange_multilane.exe").toString(),
+                        "--midi", midi.toString(), "--out", output.toString(),
+                        "--split", "instrument", "--lanes", "1", "--resolution", "2",
+                        "--poly-cap", "128", "--lane-gap", "2"));
+                RedStoneMusic.LOGGER.info("在线多乐器转换完成: {}", output);
+                return output;
+            } catch (IOException e) {
+                throw new IllegalStateException("在线转换失败", e);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IllegalStateException("在线转换被中断", e);
             } finally {
                 deleteTree(jobDirectory);
             }

@@ -8,6 +8,7 @@ enum class EvKind {
     NoteOn,
     NoteOff,
     SetTempo,
+    ProgramChange,
     Other
 };
 
@@ -18,9 +19,11 @@ struct MidiEvent {
     int note = 0;
     int velocity = 0;
     int tempo = 0;
+    int program = 0;
 };
 
 struct MidiTrackData {
+    std::string name;
     std::vector<MidiEvent> events;
 };
 
