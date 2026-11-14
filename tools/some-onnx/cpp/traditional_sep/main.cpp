@@ -1,10 +1,11 @@
 // traditional_sep.cpp — 传统算法音源分离（纯 CPU、固定 6 类、能量门限）
 //
-// 与 Python 版 tools/some-onnx/src/traditional_separate.py 算法对齐：
-//   STFT -> REPET-SIM(人声/伴奏，非局部中值滤波 + Wiener 软掩蔽)
-//        -> HPSS(鼓/谐波，时间轴/频率轴中值滤波)
-//        -> 谐波频段切分(贝斯<250Hz / 吉他250~1000Hz / 钢琴>1kHz / other=剩余)
-// 能量占比 < 1.5% 的轨道丢弃。硬编码 7 物理线程。
+// 链路（v2）：
+//   STFT -> HPSS(时间/频率轴中值，17/17 核) 拆 drums / harmonic
+//        -> 对 harmonic 做 REPET-SIM(对数频带特征 + kNN 相似帧平均) 拆 vocals / instrumental
+//        -> instrumental 在 STFT 域按平滑交叉权重切 bass / guitar / piano / other（权重和恒为 1）
+// 掩蔽做 3x3 平滑并夹到 [MASK_FLOOR, 1-MASK_FLOOR]，抑制音乐噪声；
+// 写盘时按所有轨道的统一峰值缩放，避免单轨归一化打乱相对音量。
 //
 // 用法: traditional_sep <input.wav> <outdir>
 // 输出: <outdir>/target_0_drums.wav ... target_5_piano.wav（float32 立体声）
@@ -34,10 +35,15 @@ using cpx = std::complex<double>;
 static const int NUM_THREADS = 7;   // 硬编码物理线程数
 static const int N_FFT = 2048;
 static const int HOP = 512;
-static const int REPET_WIDTH = 200; // 非局部滤波窗口（帧）
-static const int MED_KERNEL = 31;   // HPSS 中值滤波核（帧/频点）
+static const int HPSS_TIME_KERNEL = 17;   // 谐波方向（沿时间）中值核
+static const int HPSS_FREQ_KERNEL = 17;   // 打击方向（沿频率）中值核
+static const int REPET_STRIDE = 4;        // REPET 特征降采样步长（帧）
+static const int REPET_BANDS = 96;        // 对数频带数
+static const int REPET_NEIGHBORS = 6;     // 相似帧个数
+static const int REPET_EXCLUDE = 3;       // 排除的邻近降采样帧（避免把自己当背景）
+static const double MASK_FLOOR = 0.02;    // 掩蔽下限，避免频点被完全杀死
 static const double MIN_ENERGY = 0.015;
-static const double BASS_HZ = 250.0, GUITAR_HZ = 1000.0, SR = 44100.0;
+static const double BASS_HZ = 250.0, GUITAR_HZ = 1500.0, PIANO_HZ = 4000.0, SR = 44100.0;
 
 // ---------------- WAV IO（PCM 16bit / float32） ----------------
 struct Audio { std::vector<double> l, r; double sr; };
@@ -181,9 +187,14 @@ static void istft(const std::vector<std::vector<cpx>> &S, const std::vector<doub
             wsum[off + n] += win[n] * win[n];
         }
     }
+    // 输入在 STFT 前两端各补了 N_FFT 个零，这里按同样偏移裁掉；
+    // 边界处 wsum 仍有完整重叠，不会再出现 1e-3 量级的分母放大。
     y.assign(ns, 0.0);
-    for (int n = 0; n < ns; ++n)
-        y[n] = wsum[n] > 1e-9 ? acc[n] / wsum[n] : 0.0;   // Eigen FFT inv 归一化与否待确认，先不改
+    for (int n = 0; n < ns; ++n) {
+        long idx = (long)n + N_FFT;
+        if (idx >= nout) break;
+        y[n] = wsum[idx] > 1e-6 ? acc[idx] / wsum[idx] : 0.0;
+    }
 }
 
 // ---------------- 中值滤波（沿时间轴或频率轴） ----------------
@@ -234,75 +245,115 @@ static void softmask2(const std::vector<std::vector<double>> &X,
         }
 }
 
-// ---------------- biquad butterworth（4 阶 = 2 级联，零相位 forward-backward） ----------------
-struct Biquad { double b0, b1, b2, a1, a2; };
-
-// cookbook 低通/高通节；fc 为归一化频率(0~0.5)；Q 分配 = 4 阶 butterworth 的两节 Q（0.5412, 1.3066）
-static Biquad lowpass_section(double fc, double Q) {
-    double w0 = 2.0 * M_PI * fc, c = std::cos(w0), s = std::sin(w0);
-    double alpha = s / (2.0 * Q), a0 = 1.0 + alpha;
-    Biquad b;
-    b.b0 = (1.0 - c) / 2.0 / a0; b.b1 = (1.0 - c) / a0; b.b2 = (1.0 - c) / 2.0 / a0;
-    b.a1 = -2.0 * c / a0; b.a2 = (1.0 - alpha) / a0;
-    return b;
-}
-static Biquad highpass_section(double fc, double Q) {
-    double w0 = 2.0 * M_PI * fc, c = std::cos(w0), s = std::sin(w0);
-    double alpha = s / (2.0 * Q), a0 = 1.0 + alpha;
-    Biquad b;
-    b.b0 = (1.0 + c) / 2.0 / a0; b.b1 = -(1.0 + c) / a0; b.b2 = (1.0 + c) / 2.0 / a0;
-    b.a1 = -2.0 * c / a0; b.a2 = (1.0 - alpha) / a0;
-    return b;
-}
-// RBJ 带通（中心归一化频率 fo、Q），4 阶带通由两节不同 Q 级联近似
-static Biquad bandpass_section(double fo, double Q) {
-    double w0 = 2.0 * M_PI * fo, c = std::cos(w0), s = std::sin(w0);
-    double alpha = s / (2.0 * Q), a0 = 1.0 + alpha;
-    Biquad b;
-    b.b0 = alpha / a0; b.b1 = 0.0; b.b2 = -alpha / a0;
-    b.a1 = -2.0 * c / a0; b.a2 = (1.0 - alpha) / a0;
-    return b;
+// 3x3 时频平滑 + 夹到 [floor, 1-floor]：抑制孤立频点造成的音乐噪声
+static void smooth_and_clamp(std::vector<std::vector<double>> &M) {
+    int T = (int)M.size(), F = (int)M[0].size();
+    std::vector<std::vector<double>> out(T, std::vector<double>(F));
+    for (int t = 0; t < T; ++t) {
+        int t0 = std::max(0, t - 1), t1 = std::min(T - 1, t + 1);
+        for (int f = 0; f < F; ++f) {
+            int f0 = std::max(0, f - 1), f1 = std::min(F - 1, f + 1);
+            double acc = 0.0;
+            for (int tt = t0; tt <= t1; ++tt)
+                for (int ff = f0; ff <= f1; ++ff) acc += M[tt][ff];
+            double v = acc / ((t1 - t0 + 1) * (f1 - f0 + 1));
+            out[t][f] = std::min(1.0 - MASK_FLOOR, std::max(MASK_FLOOR, v));
+        }
+    }
+    M.swap(out);
 }
 
-static void butter_sos(double f1, double f2, int order, std::vector<Biquad> &sos) {
-    // f1/f2: 截止 Hz；f2<=0 → 高通(f1)；f1<=0 → 低通(f2)；都>0 → 带通
-    static const double QS[2] = {0.5412, 1.3066};
-    sos.clear();
-    if (f1 > 0 && f2 > 0) {
-        double fo = std::sqrt(f1 * f2);
-        for (int i = 0; i < order / 2; ++i) sos.push_back(bandpass_section(fo, QS[i]));
-    } else if (f2 > 0) {
-        for (int i = 0; i < order / 2; ++i) sos.push_back(lowpass_section(f2, QS[i]));
-    } else {
-        for (int i = 0; i < order / 2; ++i) sos.push_back(highpass_section(f1, QS[i]));
+// ---------------- REPET-SIM：对数频带特征 + kNN 相似帧平均 ----------------
+static void log_band_features(const std::vector<std::vector<double>> &X, int T, int F,
+                              std::vector<std::vector<float>> &feat, int &Td) {
+    const int bands = REPET_BANDS;
+    std::vector<int> edge(bands + 1);
+    const double loHz = 40.0, hiHz = 8000.0;
+    for (int b = 0; b <= bands; ++b) {
+        double hz = loHz * std::pow(hiHz / loHz, (double)b / bands);
+        int bin = (int)std::llround(hz * N_FFT / SR);
+        edge[b] = std::clamp(bin, 0, F - 1);
+    }
+    Td = std::max(1, (T + REPET_STRIDE - 1) / REPET_STRIDE);
+    feat.assign(Td, std::vector<float>(bands, 0.f));
+    for (int i = 0; i < Td; ++i) {
+        int t = std::min(T - 1, i * REPET_STRIDE);
+        double norm = 0.0;
+        for (int b = 0; b < bands; ++b) {
+            int a = edge[b], c = std::max(edge[b + 1], edge[b] + 1);
+            double acc = 0.0;
+            for (int k = a; k < c; ++k) acc += X[t][k];
+            float v = (float)std::log1p(acc);
+            feat[i][b] = v;
+            norm += (double)v * v;
+        }
+        norm = std::sqrt(norm);
+        if (norm > 1e-9)
+            for (auto &v : feat[i]) v = (float)(v / norm);
     }
 }
 
-static void biquad_apply(const std::vector<Biquad> &sos, const std::vector<double> &x,
-                         std::vector<double> &y) {
-    int n = (int)x.size();
-    y.assign(n, 0.0);
-    std::vector<double> cur = x;
-    for (const auto &b : sos) {
-        std::vector<double> out(n);
-        double z1 = 0, z2 = 0;
-        for (int i = 0; i < n; ++i) {
-            double v = b.b0 * cur[i] + z1;
-            z1 = b.b1 * cur[i] - b.a1 * v + z2;
-            z2 = b.b2 * cur[i] - b.a2 * v;
-            out[i] = v;
+// 每个分析帧的"重复背景"幅度：取最相似的 k 个非邻近帧的平均幅度谱
+static void repet_background(const std::vector<std::vector<double>> &X, int T, int F,
+                             std::vector<std::vector<double>> &B) {
+    std::vector<std::vector<float>> feat;
+    int Td = 0;
+    log_band_features(X, T, F, feat, Td);
+    B.assign(T, std::vector<double>(F, 0.0));
+
+    for (int i = 0; i < Td; ++i) {
+        std::vector<std::pair<float, int>> scores;
+        scores.reserve((size_t)Td);
+        for (int j = 0; j < Td; ++j) {
+            if (std::abs(i - j) <= REPET_EXCLUDE) continue;   // 邻近帧不算"重复"
+            float dot = 0.f;
+            for (int b = 0; b < REPET_BANDS; ++b) dot += feat[i][b] * feat[j][b];
+            scores.emplace_back(dot, j);
         }
-        // backward（零相位）
-        double z1r = 0, z2r = 0;
-        for (int i = n - 1; i >= 0; --i) {
-            double v = b.b0 * out[i] + z1r;
-            z1r = b.b1 * out[i] - b.a1 * v + z2r;
-            z2r = b.b2 * out[i] - b.a2 * v;
-            out[i] = v;
+        int take = std::min(REPET_NEIGHBORS, (int)scores.size());
+        if (take <= 0) continue;
+        std::partial_sort(scores.begin(), scores.begin() + take, scores.end(),
+                          [](const std::pair<float, int> &a, const std::pair<float, int> &b) {
+                              return a.first > b.first;
+                          });
+        // 降采样帧 i 覆盖的原始帧共享同一组相似帧
+        for (int t = i * REPET_STRIDE; t < std::min(T, (i + 1) * REPET_STRIDE); ++t) {
+            std::vector<double> &dst = B[t];
+            for (int n = 0; n < take; ++n) {
+                const std::vector<double> &src = X[scores[n].second * REPET_STRIDE];
+                for (int f = 0; f < F; ++f) dst[f] += src[f];
+            }
+            for (int f = 0; f < F; ++f) dst[f] /= take;
         }
-        cur.swap(out);
     }
-    y = cur;
+}
+
+// 平滑低通权重：hz <= fc-width/2 → 1；hz >= fc+width/2 → 0；中间 raised-cosine
+static double lowpass_weight(double hz, double fc, double width) {
+    double edge = std::max(1.0, width * 0.5);
+    if (hz <= fc - edge) return 1.0;
+    if (hz >= fc + edge) return 0.0;
+    double x = (hz - (fc - edge)) / (2.0 * edge);
+    return 0.5 + 0.5 * std::cos(M_PI * x);
+}
+
+// 频段权重：bass/guitar/piano/other 四点，各频点权重和恒为 1
+static void band_weights(int F, std::vector<double> &wb, std::vector<double> &wg,
+                         std::vector<double> &wp, std::vector<double> &wo) {
+    wb.resize(F); wg.resize(F); wp.resize(F); wo.resize(F);
+    const double w1 = std::max(80.0, BASS_HZ * 0.5);
+    const double w2 = std::max(200.0, GUITAR_HZ * 0.4);
+    const double w3 = std::max(400.0, PIANO_HZ * 0.25);
+    for (int k = 0; k < F; ++k) {
+        double hz = (double)k * SR / N_FFT;
+        double c1 = lowpass_weight(hz, BASS_HZ, w1);
+        double c2 = lowpass_weight(hz, GUITAR_HZ, w2);
+        double c3 = lowpass_weight(hz, PIANO_HZ, w3);
+        wb[k] = c1;
+        wg[k] = std::max(0.0, c2 - c1);
+        wp[k] = std::max(0.0, c3 - c2);
+        wo[k] = std::max(0.0, 1.0 - c3);
+    }
 }
 
 static double energy(const std::vector<double> &x) {
@@ -313,10 +364,14 @@ static double energy(const std::vector<double> &x) {
 
 int main(int argc, char **argv) {
     if (argc < 3) {
-        std::cerr << "用法: traditional_sep <input.wav> <outdir>" << std::endl;
+        std::cerr << "用法: traditional_sep <input.wav> <outdir> [--roles]" << std::endl;
         return 1;
     }
     std::string in = argv[1], outdir = argv[2];
+    bool roles = false;                 // --roles: 只输出 drums / bass / harmonic 三条
+    for (int i = 3; i < argc; ++i) {
+        if (std::string(argv[i]) == "--roles") roles = true;
+    }
     Audio a;
     if (!read_wav(in, a)) { std::cerr << "无法读取 WAV: " << in << std::endl; return 1; }
     long ns = (long)a.l.size();
@@ -327,99 +382,145 @@ int main(int argc, char **argv) {
     std::vector<double> win;
     make_hann(win, N_FFT);
 
-    // 1) STFT
+    // 1) STFT（两端各补 N_FFT 个零，保证 WOLA 边界也有完整重叠）
+    std::vector<double> mix_pad(N_FFT, 0.0);
+    mix_pad.insert(mix_pad.end(), mix.begin(), mix.end());
+    mix_pad.insert(mix_pad.end(), N_FFT, 0.0);
     std::vector<std::vector<cpx>> S;
-    stft(mix, win, S);
+    stft(mix_pad, win, S);
     int T = (int)S.size(), F = N_FFT / 2 + 1;
     std::vector<std::vector<double>> Smag(T, std::vector<double>(F));
     for (int t = 0; t < T; ++t)
         for (int k = 0; k < F; ++k) Smag[t][k] = std::abs(S[t][k]);
 
-    // 2) REPET-SIM：非局部中值（宽度 REPET_WIDTH）→ 伴奏掩蔽
-    std::vector<std::vector<double>> Sfilter(T, std::vector<double>(F));
-    {
-        int half = REPET_WIDTH / 2;
-        std::vector<std::thread> pool;
-        int per = std::max(1, (T + NUM_THREADS - 1) / NUM_THREADS);
-        for (int t0 = 0; t0 < T; t0 += per)
-            pool.emplace_back([&, t0]() {
-                std::vector<double> winv;
-                for (int t = t0; t < std::min(T, t0 + per); ++t) {
-                    int lo = std::max(0, t - half), hi = std::min(T - 1, t + half);
-                    for (int k = 0; k < F; ++k) {
-                        winv.clear();
-                        for (int tt = lo; tt <= hi; ++tt) winv.push_back(Smag[tt][k]);
-                        std::nth_element(winv.begin(), winv.begin() + winv.size() / 2, winv.end());
-                        Sfilter[t][k] = std::min(Smag[t][k], winv[winv.size() / 2]);
-                    }
-                }
-            });
-        for (auto &th : pool) th.join();
-    }
-    std::vector<std::vector<double>> resi(T, std::vector<double>(F)), mask(T, std::vector<double>(F));
-    for (int t = 0; t < T; ++t)
-        for (int k = 0; k < F; ++k) resi[t][k] = Smag[t][k] - Sfilter[t][k];
-    softmask2(Sfilter, resi, mask);
-    std::vector<std::vector<cpx>> Sv(T, std::vector<cpx>(F)), Sa(T, std::vector<cpx>(F));
-    for (int t = 0; t < T; ++t)
-        for (int k = 0; k < F; ++k) {
-            Sv[t][k] = S[t][k] * (1.0 - mask[t][k]);
-            Sa[t][k] = S[t][k] * mask[t][k];
-        }
-    std::vector<double> vocals(ns), accomp(ns);
-    istft(Sv, win, (int)ns, vocals);
-    istft(Sa, win, (int)ns, accomp);
+    // 2) HPSS：先拆打击/谐波（时间轴中值→谐波侧，频率轴中值→打击侧）
+    std::vector<std::vector<double>> Hm, Pm;
+    median_filter(Smag, 0, HPSS_TIME_KERNEL, Hm);
+    median_filter(Smag, 1, HPSS_FREQ_KERNEL, Pm);
+    std::vector<std::vector<double>> mh;
+    softmask2(Hm, Pm, mh);
+    smooth_and_clamp(mh);
 
-    // 3) HPSS：伴奏 → 谐波/打击乐
-    std::vector<std::vector<double>> A(T, std::vector<double>(F)), Ah, Ap;
-    for (int t = 0; t < T; ++t) for (int k = 0; k < F; ++k) A[t][k] = std::abs(Sa[t][k]);
-    median_filter(A, 0, MED_KERNEL, Ah);   // 时间轴中值 → 谐波侧
-    median_filter(A, 1, MED_KERNEL, Ap);   // 频率轴中值 → 打击侧
-    std::vector<std::vector<double>> mh, mp;
-    softmask2(Ah, Ap, mh);
-    std::vector<std::vector<cpx>> Sh(T, std::vector<cpx>(F)), Sp(T, std::vector<cpx>(F));
+    std::vector<std::vector<cpx>> Sp(T, std::vector<cpx>(F)), Sh(T, std::vector<cpx>(F));
+    std::vector<std::vector<double>> Hmag(T, std::vector<double>(F));
     for (int t = 0; t < T; ++t)
         for (int k = 0; k < F; ++k) {
-            Sh[t][k] = Sa[t][k] * mh[t][k];
-            Sp[t][k] = Sa[t][k] * (1.0 - mh[t][k]);
+            Sp[t][k] = S[t][k] * (1.0 - mh[t][k]);
+            Sh[t][k] = S[t][k] * mh[t][k];
+            Hmag[t][k] = std::abs(Sh[t][k]);
         }
-    std::vector<double> drums(ns), harm(ns);
+    std::vector<double> drums(ns);
     istft(Sp, win, (int)ns, drums);
-    istft(Sh, win, (int)ns, harm);
 
-    // 4) 谐波频段切分
-    std::vector<Biquad> sos_lp, sos_bp, sos_hp;
-    butter_sos(0, BASS_HZ / (SR / 2), 4, sos_lp);
-    butter_sos(BASS_HZ / (SR / 2), GUITAR_HZ / (SR / 2), 4, sos_bp);
-    butter_sos(GUITAR_HZ / (SR / 2), 0, 4, sos_hp);
-    std::vector<double> bass, guitar, piano, other;
-    biquad_apply(sos_lp, harm, bass);
-    biquad_apply(sos_bp, harm, guitar);
-    biquad_apply(sos_hp, harm, piano);
-    other.resize(ns);
-    for (long i = 0; i < ns; ++i) other[i] = harm[i] - bass[i] - guitar[i] - piano[i];
+    // 诊断：HPSS 的谱能量分配
+    double eh = 0, ep = 0, mh_sum = 0;
+    for (int t = 0; t < T; ++t)
+        for (int k = 0; k < F; ++k) {
+            eh += std::norm(Sh[t][k]);
+            ep += std::norm(Sp[t][k]);
+            mh_sum += mh[t][k];
+        }
+    std::printf("  HPSS: harmonic=%.3f percussive=%.3f mh_mean=%.3f\n",
+                eh / (eh + ep + 1e-12), ep / (eh + ep + 1e-12),
+                mh_sum / (double)T / F);
+    {
+        double ed = 0, em = 0;
+        for (double v : drums) ed += v * v;
+        for (double v : mix) em += v * v;
+        std::printf("  HPSS waveform: drums_rms=%.5f mix_rms=%.5f\n",
+                    std::sqrt(ed / (double)drums.size()), std::sqrt(em / (double)mix.size()));
+    }
 
-    // 5) 能量门限 + 写盘
-    const char *names[6] = {"drums", "bass", "other", "vocals", "guitar", "piano"};
-    std::vector<std::vector<double>> stems = {drums, bass, other, vocals, guitar, piano};
-    std::vector<double> en(6);
+    // 3) REPET-SIM：谐波分量 → 重复背景(伴奏) / 非重复前景(人声)
+    std::vector<std::vector<double>> background;
+    repet_background(Hmag, T, F, background);
+    std::vector<std::vector<double>> foreground(T, std::vector<double>(F));
+    for (int t = 0; t < T; ++t)
+        for (int k = 0; k < F; ++k)
+            foreground[t][k] = std::max(0.0, Hmag[t][k] - background[t][k]);
+    std::vector<std::vector<double>> mfg;
+    softmask2(foreground, background, mfg);   // 前景权重
+    smooth_and_clamp(mfg);
+
+    std::vector<std::vector<cpx>> Sv(T, std::vector<cpx>(F)), Si(T, std::vector<cpx>(F));
+    for (int t = 0; t < T; ++t)
+        for (int k = 0; k < F; ++k) {
+            Sv[t][k] = Sh[t][k] * mfg[t][k];
+            Si[t][k] = Sh[t][k] * (1.0 - mfg[t][k]);
+        }
+    std::vector<double> vocals(ns);
+    istft(Sv, win, (int)ns, vocals);
+
+    // 诊断：REPET 的前景/背景谱能量分配
+    double ef = 0, eb = 0;
+    for (int t = 0; t < T; ++t)
+        for (int k = 0; k < F; ++k) { ef += std::norm(Sv[t][k]); eb += std::norm(Si[t][k]); }
+    std::printf("  REPET: foreground=%.3f background=%.3f\n", ef / (ef + eb + 1e-12),
+                eb / (ef + eb + 1e-12));
+
+    // 4) 谐波频段切分：STFT 域平滑交叉权重，四段和恒等于 instrumental
+    std::vector<double> wb, wg, wp, wo;
+    band_weights(F, wb, wg, wp, wo);
+    std::vector<std::vector<cpx>> Sb(T, std::vector<cpx>(F)), Sg(T, std::vector<cpx>(F));
+    std::vector<std::vector<cpx>> Spn(T, std::vector<cpx>(F)), So(T, std::vector<cpx>(F));
+    for (int t = 0; t < T; ++t)
+        for (int k = 0; k < F; ++k) {
+            const cpx &v = Si[t][k];
+            Sb[t][k] = v * wb[k];
+            Sg[t][k] = v * wg[k];
+            Spn[t][k] = v * wp[k];
+            So[t][k] = v * wo[k];
+        }
+    std::vector<double> bass(ns), guitar(ns), piano(ns), other(ns);
+    istft(Sb, win, (int)ns, bass);
+    istft(Sg, win, (int)ns, guitar);
+    istft(Spn, win, (int)ns, piano);
+    istft(So, win, (int)ns, other);
+
+    // 5) 能量门限 + 统一峰值缩放 + 写盘
+    // --roles：按下游只认 drums/bass/harp/basedrum 的事实，把谐波段并成一条 harmonic，
+    // 避免同一条旋律被 vocals/guitar/piano 各转写一次产生八度重复音符。
+    const char *names6[6] = {"drums", "bass", "other", "vocals", "guitar", "piano"};
+    std::vector<std::vector<double>> stems6 = {drums, bass, other, vocals, guitar, piano};
+    std::vector<std::vector<double>> stems;
+    std::vector<std::string> names;
+    if (roles) {
+        std::vector<std::vector<cpx>> Shr(T, std::vector<cpx>(F));
+        for (int t = 0; t < T; ++t)
+            for (int k = 0; k < F; ++k)
+                Shr[t][k] = Sh[t][k] * (1.0 - wb[k]);   // 谐波 - bass
+        std::vector<double> harmonic(ns);
+        istft(Shr, win, (int)ns, harmonic);
+        stems = {drums, bass, harmonic};
+        names = {"drums", "bass", "harmonic"};
+    } else {
+        stems = stems6;
+        for (const char *n : names6) names.emplace_back(n);
+    }
+
+    const int count = (int)stems.size();
+    std::vector<double> en(count);
     double tot = 0;
-    for (int i = 0; i < 6; ++i) { en[i] = energy(stems[i]); tot += en[i]; }
+    for (int i = 0; i < count; ++i) { en[i] = energy(stems[i]); tot += en[i]; }
+
+    // 所有轨道共用同一个缩放系数，保持相对音量不变；避免硬 clip 引入失真
+    double peak = 0.0;
+    for (const auto &s : stems)
+        for (double v : s) peak = std::max(peak, std::abs(v));
+    double gain = peak > 0.95 ? 0.95 / peak : 1.0;
+
     fs::create_directories(outdir);
-    for (int i = 0; i < 6; ++i) {
+    for (int i = 0; i < count; ++i) {
         double ratio = en[i] / (tot + 1e-12);
         if (ratio < MIN_ENERGY) {
-            std::printf("  stem %-6s 能量占比 %.3f < %.3f → 丢弃\n", names[i], ratio, MIN_ENERGY);
+            std::printf("  stem %-8s 能量占比 %.3f < %.3f → 丢弃\n", names[i].c_str(), ratio, MIN_ENERGY);
             continue;
         }
-        // 掩蔽稀疏谱会产生个别巨大尖峰（相位叠加），统一 clip 到 [-1,1] 再缩放，
-        // 避免尖峰污染整体音量（这是"还原不像"的根因之一）
-        std::vector<double> outl = stems[i], outr = stems[i];
-        for (auto &v : outl) v = std::clamp(v, -1.0, 1.0) * 0.9;
-        for (auto &v : outr) v = std::clamp(v, -1.0, 1.0) * 0.9;
+        std::vector<double> outl(stems[i].size()), outr(stems[i].size());
+        for (size_t n = 0; n < stems[i].size(); ++n) outl[n] = outr[n] = stems[i][n] * gain;
         fs::path p = fs::path(outdir) / ("target_" + std::to_string(i) + "_" + names[i] + ".wav");
         write_wav_f32(p.string(), outl, outr, SR);
-        std::printf("  stem %-6s 能量占比 %.3f → 保留 (%s)\n", names[i], ratio, p.string().c_str());
+        std::printf("  stem %-8s 能量占比 %.3f → 保留 (%s)\n", names[i].c_str(), ratio, p.string().c_str());
     }
     auto t1 = std::chrono::steady_clock::now();
     double secs = std::chrono::duration<double>(t1 - t0).count();

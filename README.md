@@ -4,6 +4,8 @@
 
 AutoRedStoneMusic 的目标，是把一首歌曲从普通音频文件直接变成可以在 Minecraft 世界中放置、播放和分享的红石音乐结构。用户只需要把 MP3 或 WAV 放入指定目录，即可在游戏内调用转换工具，生成 `.nbt` 结构并放置到玩家面前。
 
+> **本次更新（2026-11-14）**：**传统分离链路重构**。分离改为 HPSS → REPET-SIM(kNN) → STFT 域平滑交叉分频，输出 `drums / bass / harmonic` 三个角色；转写改为「全混音一次 + harmonic/bass 各一次」后做**音符级交集融合**（新增 C++ 工具 `fuse_midis.exe`），比单次转写 top1 提升约 **+5.4 个百分点**、音符盒减少约 39%。同时修复 WOLA 边界尖峰、红石粉长度误报，`midi_to_nbt` 新增 `--poly-cap`，单轨移调改为整八度。
+
 > **本次更新（2026-11-08）**：新增**在线多乐器转写**（可选联网）。`Convert <歌名> online` 会把音频交给公开部署的在线模型转写，得到带乐器信息的 MIDI，再直接生成**按乐器分轨的多轨结构**（轨道数 = 乐器数）。执行命令后聊天栏会先询问是否允许上传，点「是」才开始；该分支固定参数、不接受其它命令参数，转换完成自动放置。
 
 > **本次更新（2026-11-06）**：`midi_to_nbt.exe`、`arrange_multilane.exe`、`merge_midis.exe` 已由 Python/PyInstaller **重写为 C++17**，逐方块/逐音符输出与旧版一致；实测提速约 **108× / 53× / 145×**，模组 JAR 因此缩小约 **54 MB**。新增独立的 **NTB → NBS（Note Block Studio）** 导出工具。README 补充了从克隆仓库到构建模组的完整步骤（含 Git LFS）。
@@ -37,6 +39,7 @@ AutoRedStoneMusic 的目标，是把一首歌曲从普通音频文件直接变�
 - **新增：C++17 快速工具链**——`midi_to_nbt` / `arrange_multilane` / `merge_midis` 已从 Python/PyInstaller 重写为 C++17，输出与原版一致，速度提升约 53×~145×，模组 JAR 缩小约 54 MB。
 - **新增：NTB → NBS 导出**——独立 C++ 工具 `ntb_to_nbs.exe` 可把已生成的红石结构转换为 Note Block Studio 的 `.nbs`（v4，20 TPS），便于在 NBS 中查看、编辑和二次分享。
 - **新增：在线多乐器转写（可选联网）**——`Convert <歌名> online` 使用公开部署的在线模型完成多乐器转写，不需要本机运行推理模型；结果直接生成按乐器分轨的多轨结构（`bass / harp / bell / basedrum`，轨道数 = 实际出现的乐器数）。上传前需在聊天栏点「是」确认，点「否」不会上传任何文件。
+- **新增：传统链路三角色分离 + 音符级融合**——传统引擎只输出 `drums / bass / harmonic` 三条（下游本就只有 basedrum/bass/harp/bell 四种音色），转写改成「全混音一次 + harmonic/bass 各一次」，再用 `fuse_midis` 取交集；并集反而更差，交集能同时保住召回与精度。
 
 ## 工作流程
 
@@ -66,7 +69,7 @@ Minecraft Structure NBT
 Forge 模组读取并放置到玩家前方
 ```
 
-多音轨（新增）链路：
+多音轨（传统引擎，2026-11-14 重构）：
 
 ```text
 MP3/WAV
@@ -75,22 +78,26 @@ MP3/WAV
 FFmpeg 规整为 44.1kHz 立体声 16-bit PCM WAV
    |
    v
-音源分离（二选一）
-   ├─ ai  ：demucs_mt.cpp.main.exe + htdemucs 模型（4 轨）
-   └─ trad：traditional_sep.exe（REPET-SIM + HPSS，6 轨）
+traditional_sep.exe --roles
+   ├─ HPSS（时间/频率轴中值 17/17）：drums / harmonic
+   ├─ REPET-SIM（96 对数频带 + kNN 相似帧平均）：vocals / instrumental
+   └─ STFT 域平滑交叉分频：bass <250Hz，harmonic = 其余
    |
    v
-能量门限：丢弃能量占比 < 1.5% 的音轨
+三条角色轨：drums / bass / harmonic（能量和恒为 1，无重叠）
+   |
+   ├─ audio_to_midi.exe（全混音）      → mix.mid      召回
+   ├─ audio_to_midi.exe（harmonic）    → harm.mid     精度
+   └─ audio_to_midi.exe（bass）        → bass.mid
    |
    v
-逐轨 audio_to_midi.exe（Basic Pitch）
+fuse_midis.exe：保留 mix 中能在 harm/bass 找到匹配（±0.12s、同音高）的音符
    |
    v
-merge_midis.exe 合并为单一 MIDI
-   |
-   v
-midi_to_nbt.exe 单轨三档映射 → Minecraft Structure NBT
+midi_to_nbt.exe --poly-cap 13 → Minecraft Structure NBT
 ```
+
+AI 引擎（Demucs）仍沿用“逐轨转写 → `merge_midis` 合并”的旧链路。
 
 多轨结构（可选，2026-10-31 新增）：
 
@@ -161,7 +168,8 @@ arrange_multilane.exe --split instrument
    - AI 音源分离（Demucs htdemucs，4 轨），C++ 多线程 CPU 推理 + 模型权重。
 
 6. `traditional_sep.exe`
-   - 传统算法分离（C++17 + Eigen，6 轨，7 线程）。
+   - 传统算法分离（C++17 + Eigen，7 线程）。
+   - `--roles` 模式输出 `drums / bass / harmonic` 三条；否则输出 6 条细分类。
 
 7. `ntb_to_nbs.exe`（独立工具，2026-11-06 新增，未打进模组）
    - NTB → Note Block Studio `.nbs`（v4，20 TPS）。
@@ -171,6 +179,10 @@ arrange_multilane.exe --split instrument
    - 直接向公开部署的在线模型提交音频，读取转写完成的多乐器 MIDI，再交给 `arrange_multilane.exe --split instrument` 生成多轨结构。
    - 不占用本机推理 CPU / 显存，但需要联网；不含本地回退，在线服务不可用时转换失败。
    - 服务地址集中在源码的在线转写客户端中，可按需替换为其它公开部署的在线服务。
+
+9. `fuse_midis.exe`（C++17，2026-11-14 新增）
+   - 音符级投票融合：`--primary` 为全混音转写结果，`--pool` 为分离轨转写结果（可多次）；保留 primary 中在 pool 里能找到匹配（`--tol` 秒、`--semis` 半音）的音符。
+   - 源码在 `tools/some-onnx/cpp/fast_tools/fast_fuse_midis.cpp`。
 
 模组通过 `ProcessBuilder` 调用这些 EXE，不使用 JNI，因此音频推理、音源分离和 NBT 生成与 Minecraft JVM 解耦，便于调试、替换和独立测试。在线转写是唯一的联网链路，且必须先经玩家在聊天栏确认。
 
@@ -202,12 +214,15 @@ redstonemusic/tools/
 ├── ggml-model-htdemucs-4s-f16.bin
 ├── traditional_sep.exe
 ├── merge_midis.exe
+├── fuse_midis.exe
 └── arrange_multilane.exe
 ```
 
 上面的 `redstonemusic/tools/` 是临时工作目录中的资源目录，不是用户需要手动创建的配置目录。
 
 ## 游戏内命令
+
+> **本次更新（2026-11-14）**：命令语法未变，但 `trad true` 的内部实现改为三角色分离 + 音符级融合；单轨/多轨 NBT 生成统一带 `--poly-cap 13`（单列超限保留高音，避免支线总线超过 15 格报错）；单轨移调改为整八度。
 
 > **本次更新（2026-11-08）**：`Convert` 新增 `online` 分支：`Convert <歌名> online`。该分支不接受其它命令参数；执行后先在聊天栏询问是否允许上传音频，点「是」才联网转写，随后按乐器分轨并自动放置。生成文件名为 `<原名>_online_multi.ntb`。
 
@@ -262,6 +277,8 @@ redstonemusic/tools/
 
 ## 测试结果
 
+> **本次更新（2026-11-14）**：新增欢乐颂前 30 秒的传统链路重构对比（6 轨 / 3 角色 / 音符级融合），以及分离环节的客观指标。
+
 > **本次更新（2026-10-31）**：补充卡农（无 vocals）前 30 秒的单轨 vs 传统分离对比，以及 3 轨直排结构实测；新增 MIDI/NBT 损失量化工具与结果。结构支撑材质统一为平滑石英。
 >
 > **本次更新（2026-10-11）**：新增多音轨（AI / 传统分离 → 能量门限 → 逐轨 MIDI → 合并 → 单轨三档）结构测试；补充 C++ 传统分离还原度核验——把分离出的音轨合成回原曲，与原始音频的相似度（相关系数）约 0.98 量级，确认分离与写盘环节保真。
@@ -310,6 +327,25 @@ C++ 重写等价性与提速（2026-11-06）：
 | `merge_midis` | 823.8 ms | 5.7 ms | **144.5×** |
 
 计时包含旧版 PyInstaller 启动开销；不同机器上会有波动，复测 `midi_to_nbt` 约 1.49~1.70 s → 17.1~17.6 ms。
+
+传统链路重构（2026-11-14，欢乐颂前 30 秒，44.1kHz 立体声）：
+
+| 链路 | 音符盒 | 结构尺寸 | 全局 chroma | 逐音符 top1 | top3 |
+|---|---:|---|---:|---:|---:|
+| 单次全混音转写 | 325 | 609×2×9 | 0.8570 | 37.5% | 76.3% |
+| 旧传统（6 轨各自转写） | 754 | 993×2×13 | 0.9175 | 30.8% | 71.4% |
+| 传统 6 轨 + 新分离 | 752 | 969×2×15 | 0.9114 | 34.4% | 72.6% |
+| 传统 3 角色（drums/bass/harmonic） | 479 | 761×2×12 | 0.8800 | 33.4% | 70.8% |
+| **3 角色 + 音符级融合（新默认）** | **198** | **455×2×8** | **0.8919** | **42.9%** | **78.8%** |
+
+分离环节指标（同素材）：
+
+| 版本 | vocals 能量占比 | 重建 corr / 残差 | bass 谱质心 |
+|---|---:|---|---:|
+| 旧（中值 REPET + 滤波器分频） | 56.8% | 0.9948 / 0.0095 | 171Hz |
+| 新（kNN REPET + STFT 分频 + WOLA 补零） | 13.5% | 0.9995 / 0.0022 | 103Hz |
+
+融合规则消融（MIDI 层，offset=0）：并集 37.8% < 单次转写 38.5% < harmonic 单轨 43.5% < **交集（harmonic∪bass）44.9%**。
 
 测试覆盖：
 
@@ -459,7 +495,8 @@ src/main/resources/                模组元数据和运行时工具资源
  tools/some-onnx/cpp/              C++ 音频推理源码与构建脚本
  tools/some-onnx/cpp/traditional_sep/   C++ 传统音源分离
  tools/some-onnx/cpp/eigen/         Eigen 头文件库
- tools/some-onnx/cpp/fast_tools/    C++17 快速工具（midi_to_nbt / arrange_multilane / merge_midis）
+ tools/some-onnx/cpp/fast_tools/    C++17 快速工具（midi_to_nbt / arrange_multilane / merge_midis / fuse_midis）
+ tools/some-onnx/cpp/fast_tools/fast_fuse_midis.cpp   音符级投票融合（2026-11-14）
  tools/some-onnx/cpp/ntb_to_nbs/    NTB → NBS 转换器
  tools/some-onnx/src/              MIDI、NBT 和 Python 辅助源码
  tools/some-onnx/src/arrange_multilane.py   最终 MIDI → 多轨直排结构
@@ -479,7 +516,7 @@ src/main/resources/                模组元数据和运行时工具资源
 
 ### 为什么会释放并启动 EXE/DLL
 
-模组 JAR 内包含固定版本的 `audio_to_midi.exe`、`midi_to_nbt.exe`、`arrange_multilane.exe`、`demucs_mt.cpp.main.exe`、`traditional_sep.exe`、`merge_midis.exe`、Demucs 模型权重、FFmpeg、ONNX Runtime DLL 和 `nmp.onnx` 权重。初始化时，模组把这些资源复制到系统临时目录下新建的 `RedStoneMusic-*` 工作目录。这样做是为了让 Windows 能从普通文件路径加载可执行文件和 DLL；它们不是从网络下载的，也不会从歌曲文件中提取或安装程序。转换命令通过 `ProcessBuilder` 以参数列表启动这些指定 EXE，而不是经由 shell 拼接命令。
+模组 JAR 内包含固定版本的 `audio_to_midi.exe`、`midi_to_nbt.exe`、`arrange_multilane.exe`、`fuse_midis.exe`、`demucs_mt.cpp.main.exe`、`traditional_sep.exe`、`merge_midis.exe`、Demucs 模型权重、FFmpeg、ONNX Runtime DLL 和 `nmp.onnx` 权重。初始化时，模组把这些资源复制到系统临时目录下新建的 `RedStoneMusic-*` 工作目录。这样做是为了让 Windows 能从普通文件路径加载可执行文件和 DLL；它们不是从网络下载的，也不会从歌曲文件中提取或安装程序。转换命令通过 `ProcessBuilder` 以参数列表启动这些指定 EXE，而不是经由 shell 拼接命令。
 
 ### 文件访问和清理范围
 

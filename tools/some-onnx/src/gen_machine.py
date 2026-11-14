@@ -111,7 +111,9 @@ def build_pitch_map(pitches, track=None):
     med = statistics.median(pitches)
     bank = TRACK_BANKS.get(track)
     center = (bank[2] + NOTE_CENTER) if bank else (NOTE_BASE_MIDI + NOTE_CENTER)
-    shift = int(round(center - med))
+    # 只允许整八度移调：音级完全不变，避免 ±1~±11 半音造成的可听跑调；
+    # 中位数偏离中心不足半个八度时保持原调，由三档垫块兜住音域。
+    shift = 12 * int(round((center - med) / 12.0))
 
     def conv(p):
         q = int(p) + shift

@@ -34,3 +34,11 @@ tools/hyperchoron/latest.log
 *.nbs
 *.mcfunction
 build-setup.log
+
+# Third-party reference projects and local analysis output (not part of the mod)
+McMusicMaker/
+minecraft-note-studio-1.21.11-fabric.v2/
+minecraft-note-studio-decompiled/
+out_compare30/
+out_notestudio/
+bin/

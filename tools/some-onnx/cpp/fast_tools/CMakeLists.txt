@@ -16,7 +16,7 @@ if(MSVC)
     target_compile_options(fast_core PRIVATE /O2 /EHsc /utf-8 /W3)
 endif()
 
-foreach(tool fast_midi_to_nbt fast_arrange_multilane fast_merge_midis)
+foreach(tool fast_midi_to_nbt fast_arrange_multilane fast_merge_midis fast_fuse_midis)
     add_executable(${tool} ${tool}.cpp)
     target_link_libraries(${tool} PRIVATE fast_core)
     if(MSVC)

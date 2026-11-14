@@ -31,6 +31,7 @@ int main(int argc, char** argv) {
     std::string layout = "folded";
     std::string track;
     bool has_track = false;
+    int poly_cap = 0;              // 0 = 不限制；>0 时每列只保留音高最高的 N 个音符
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -59,6 +60,10 @@ int main(int argc, char** argv) {
         } else if (a == "--track") {
             if (!take_value(track)) { std::fprintf(stderr, "missing value for --track\n"); return 2; }
             has_track = true;
+        } else if (a == "--poly-cap") {
+            std::string v;
+            if (!take_value(v)) { std::fprintf(stderr, "missing value for --poly-cap\n"); return 2; }
+            poly_cap = std::stoi(v);
         } else if (startsWith(a, "--")) {
             std::fprintf(stderr, "unknown option: %s\n", a.c_str());
             return 2;
@@ -165,7 +170,14 @@ int main(int argc, char** argv) {
 
         int max_per_col = 0;
         int total_notes = 0;
-        for (const auto& kv : col_notes) {
+        int capped_notes = 0;
+        for (auto& kv : col_notes) {
+            // 支线总线是直线红石粉，长度受 15 格限制；每列最多 14 个音符，
+            // 超出时保留音高最高的（与 arrange_multilane 的 --poly-cap 语义一致）
+            if (poly_cap > 0 && static_cast<int>(kv.second.size()) > poly_cap) {
+                capped_notes += static_cast<int>(kv.second.size()) - poly_cap;
+                kv.second.erase(kv.second.begin(), kv.second.end() - poly_cap);
+            }
             max_per_col = std::max(max_per_col, static_cast<int>(kv.second.size()));
             total_notes += static_cast<int>(kv.second.size());
         }
@@ -188,9 +200,9 @@ int main(int argc, char** argv) {
             return 1;
         }
 
-        std::printf("notes=%d columns=%d blocks=%zu note_blocks=%zu size=%d,%d,%d\n",
+        std::printf("notes=%d columns=%d blocks=%zu note_blocks=%zu size=%d,%d,%d capped=%d\n",
                     total_notes, columns, result.blocks.size(), result.note_blocks.size(),
-                    sx, sy, sz);
+                    sx, sy, sz, capped_notes);
     } catch (const std::exception& e) {
         std::fprintf(stderr, "error: %s\n", e.what());
         return 1;

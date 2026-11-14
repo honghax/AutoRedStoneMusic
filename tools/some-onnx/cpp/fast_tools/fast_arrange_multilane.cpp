@@ -174,7 +174,8 @@ void layoutInstrumentLanes(std::vector<InstrumentLane>& lanes, int gap, int& bus
 }
 
 int runInstrumentSplit(const std::string& midi_path, const std::string& out_path,
-                       const std::string& json_path, int resolution, int lane_gap) {
+                       const std::string& json_path, int resolution, int lane_gap,
+                       double align_lead) {
     std::string error;
     MidiFileData midi;
     if (!readMidiFile(midi_path, midi, error)) {
@@ -186,6 +187,24 @@ int runInstrumentSplit(const std::string& midi_path, const std::string& out_path
     if (notes.empty()) {
         std::fprintf(stderr, "MIDI has no notes\n");
         return 1;
+    }
+
+    // 在线模型返回的 MIDI 可能带前导静音/补齐到小节；把首个音符对齐到原曲起音。
+    if (align_lead >= 0.0) {
+        double first = notes.front().start;
+        for (const auto& n : notes) first = std::min(first, n.start);
+        double delta = align_lead - first;
+        std::vector<RoleNote> shifted;
+        shifted.reserve(notes.size());
+        for (const auto& n : notes) {
+            RoleNote m = n;
+            m.start = std::max(0.0, n.start + delta);
+            m.end = std::max(m.start, n.end + delta);
+            shifted.push_back(m);
+        }
+        notes.swap(shifted);
+        std::printf("align_lead: first=%.3fs target=%.3fs delta=%+.3fs\n",
+                    first, align_lead, delta);
     }
 
     double col_seconds = static_cast<double>(resolution) / 20.0;
@@ -369,6 +388,7 @@ int main(int argc, char** argv) {
     int resolution = 2;
     int poly_cap = 20;
     int lane_gap = 2;
+    double align_lead = -1.0;      // <0：不做时间对齐
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -411,6 +431,10 @@ int main(int argc, char** argv) {
             std::string v;
             if (!take(v)) { std::fprintf(stderr, "missing --lane-gap\n"); return 2; }
             lane_gap = std::stoi(v);
+        } else if (name == "--align-lead") {
+            std::string v;
+            if (!take(v)) { std::fprintf(stderr, "missing --align-lead\n"); return 2; }
+            align_lead = std::stod(v);
         } else if (name == "--json") {
             if (!take(json_path)) { std::fprintf(stderr, "missing --json\n"); return 2; }
         } else {
@@ -437,7 +461,8 @@ int main(int argc, char** argv) {
 
     if (split == "instrument") {
         try {
-            return runInstrumentSplit(midi_path, out_path, json_path, resolution, lane_gap);
+            return runInstrumentSplit(midi_path, out_path, json_path, resolution, lane_gap,
+                                      align_lead);
         } catch (const std::exception& e) {
             std::fprintf(stderr, "error: %s\n", e.what());
             return 1;

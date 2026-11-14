@@ -132,7 +132,10 @@ PitchMap buildPitchMap(const std::vector<int>& pitches, const std::string* track
     if (pm.has_bank) pm.bank = trackBank(*track);
     int center = pm.has_bank ? (pm.bank.base + NOTE_CENTER)
                             : (NOTE_BASE_MIDI + NOTE_CENTER);
-    pm.shift = pyRound(static_cast<double>(center) - med);
+    // 只允许整八度移调：音级（pitch class）完全不变，避免 ±1~±11 半音造成的可听跑调。
+    // 中位数偏离中心不足半个八度时保持原调，由三档垫块自行兜住音域。
+    double octaves = (static_cast<double>(center) - med) / 12.0;
+    pm.shift = 12 * pyRound(octaves);
     return pm;
 }
 
@@ -607,36 +610,60 @@ bool validateStructure(const BuildResult& result, int resolution,
                            std::to_string(adj.size()));
     }
 
-    // Longest continuous dust run must be <= 15.
+    // Longest straight dust run must be <= 15.
+    // 注意：T 型分支（主干 + 跨接 + 支线总线）是一个连通域，但信号只沿各自的直线臂传播，
+    // 所以按"每个臂的直线长度"判定，而不是按整块连通域的大小。
     std::set<Pos> dust;
     for (const auto& kv : result.blocks) {
         if (kv.second.name == "minecraft:redstone_wire") dust.insert(kv.first);
     }
-    std::set<Pos> seen;
-    for (const Pos& start : dust) {
-        if (seen.count(start)) continue;
-        std::vector<Pos> stack{start};
-        seen.insert(start);
-        std::size_t count = 0;
-        while (!stack.empty()) {
-            Pos u = stack.back();
-            stack.pop_back();
-            ++count;
-            for (int i = 0; i < 4; ++i) {
-                for (int dy = -1; dy <= 1; ++dy) {
-                    Pos v{u[0] + DR[i][0], u[1] + dy, u[2] + DR[i][1]};
-                    if (dust.count(v) && !seen.count(v)) {
-                        seen.insert(v);
-                        stack.push_back(v);
-                    }
-                }
+    const int kDirs[2][2] = {{1, 0}, {0, 1}};
+    auto nextInLine = [&](const Pos& cur, int dx, int dz, Pos& out) {
+        const Pos cand[3] = {{cur[0] + dx, cur[1], cur[2] + dz},
+                             {cur[0] + dx, cur[1] + 1, cur[2] + dz},
+                             {cur[0] + dx, cur[1] - 1, cur[2] + dz}};
+        for (const Pos& p : cand) {
+            if (dust.count(p)) {
+                out = p;
+                return true;
             }
         }
-        if (count > 15) {
-            problems.push_back("redstone dust run of " + std::to_string(count) +
-                               " cells exceeds 15");
-            break;
+        return false;
+    };
+    std::size_t longest = 0;
+    Pos longest_at{0, 0, 0};
+    std::string longest_dir = "X";
+    for (const Pos& start : dust) {
+        for (const auto& d : kDirs) {
+            int dx = d[0], dz = d[1];
+            Pos back{start[0] - dx, start[1], start[2] - dz};
+            bool hasBack = dust.count(back);
+            if (!hasBack) {
+                const Pos cand[2] = {{start[0] - dx, start[1] + 1, start[2] - dz},
+                                     {start[0] - dx, start[1] - 1, start[2] - dz}};
+                for (const Pos& p : cand) hasBack = hasBack || dust.count(p);
+            }
+            if (hasBack) continue;          // 从臂的起点开始数
+            std::size_t len = 0;
+            Pos cur = start;
+            while (true) {
+                ++len;
+                Pos nxt{};
+                if (!nextInLine(cur, dx, dz, nxt)) break;
+                cur = nxt;
+            }
+            if (len > longest) {
+                longest = len;
+                longest_at = start;
+                longest_dir = dx ? "X" : "Z";
+            }
         }
+    }
+    if (longest > 15) {
+        problems.push_back("redstone dust run of " + std::to_string(longest) +
+                           " cells exceeds 15 at (" + std::to_string(longest_at[0]) + "," +
+                           std::to_string(longest_at[1]) + "," + std::to_string(longest_at[2]) +
+                           ") dir=" + longest_dir);
     }
 
     return problems.empty();

@@ -27,6 +27,7 @@ public final class MusicToolRunner implements AutoCloseable {
     private static final String DEMUCS_MODEL = "/redstonemusic/tools/ggml-model-htdemucs-4s-f16.bin";
     private static final String TRAD_EXE = "/redstonemusic/tools/traditional_sep.exe";
     private static final String MERGE_EXE = "/redstonemusic/tools/merge_midis.exe";
+    private static final String FUSE_EXE = "/redstonemusic/tools/fuse_midis.exe";
     private static final String MULTILANE_EXE = "/redstonemusic/tools/arrange_multilane.exe";
 
     private final Path workDirectory;
@@ -51,6 +52,7 @@ public final class MusicToolRunner implements AutoCloseable {
         // 传统算法分离（C++）与 MIDI 合并（多音轨流程资源）
         release(TRAD_EXE);
         release(MERGE_EXE);
+        release(FUSE_EXE);
         release(MULTILANE_EXE);
         Runtime.getRuntime().addShutdownHook(new Thread(this::close, "RedStoneMusic-tool-cleanup"));
     }
@@ -94,7 +96,8 @@ public final class MusicToolRunner implements AutoCloseable {
                             "--resolution", "2", "--poly-cap", Integer.toString(cap), "--lane-gap", "2"));
                 } else {
                     run(jobDirectory, List.of(workDirectory.resolve("midi_to_nbt.exe").toString(),
-                            midi.toString(), output.toString(), "--resolution", "2", "--layout", "simple"));
+                            midi.toString(), output.toString(), "--resolution", "2",
+                            "--layout", "simple", "--poly-cap", "13"));
                 }
                 return output;
             } finally {
@@ -155,7 +158,9 @@ public final class MusicToolRunner implements AutoCloseable {
                     if (!Files.isRegularFile(trad)) {
                         throw new IllegalStateException("多音轨资源缺失：需要 traditional_sep.exe");
                     }
-                    run(jobDirectory, List.of(trad.toString(), wav.toString(), stems.toString()));
+                    // --roles：只输出 drums/bass/harmonic 三条，
+                    // 避免同一段旋律被 vocals/guitar/piano 各转写一次产生八度重复
+                    run(jobDirectory, List.of(trad.toString(), wav.toString(), stems.toString(), "--roles"));
                 }
 
                 // 收集分离产物（target_*.wav），按能量占比丢弃弱轨
@@ -180,21 +185,57 @@ public final class MusicToolRunner implements AutoCloseable {
                 if (kept.isEmpty()) throw new IllegalStateException("所有音轨能量过低，无法生成结构");
 
                 // 逐轨转写 MIDI
-                List<Path> midis = new java.util.ArrayList<>();
-                for (Path stem : kept) {
-                    Path stemWav = normalize(stem, jobDirectory, "stem");
-                    Path midi = jobDirectory.resolve("stem_" + midis.size() + ".mid");
-                    run(jobDirectory, List.of(workDirectory.resolve("audio_to_midi.exe").toString(),
-                            stemWav.toString(), midi.toString()));
-                    midis.add(midi);
-                }
-                // 合并 MIDI → 单轨三档生成
                 Path mergedMidi = jobDirectory.resolve("merged.mid");
-                List<String> mergeCmd = new java.util.ArrayList<>();
-                mergeCmd.add(workDirectory.resolve("merge_midis.exe").toString());
-                midis.forEach(m -> mergeCmd.add(m.toString()));
-                mergeCmd.add(mergedMidi.toString());
-                run(jobDirectory, mergeCmd);
+                if (!ai) {
+                    // 传统引擎：全混音转写一次（召回）+ harmonic/bass 各转写一次（精度），
+                    // 再做音符级交集融合，避免"分轨转写把分离误差放大成伪音符"
+                    Path mixMidi = jobDirectory.resolve("mix.mid");
+                    run(jobDirectory, List.of(workDirectory.resolve("audio_to_midi.exe").toString(),
+                            wav.toString(), mixMidi.toString()));
+                    List<Path> pool = new java.util.ArrayList<>();
+                    for (Path stem : kept) {
+                        String name = stem.getFileName().toString();
+                        if (!name.contains("harmonic") && !name.contains("bass")) continue;
+                        Path midi = jobDirectory.resolve("pool_" + pool.size() + ".mid");
+                        run(jobDirectory, List.of(workDirectory.resolve("audio_to_midi.exe").toString(),
+                                stem.toString(), midi.toString()));
+                        pool.add(midi);
+                    }
+                    if (pool.isEmpty()) {
+                        // 没有可用的 harmonic/bass 轨时退回直接使用混音转写
+                        Files.copy(mixMidi, mergedMidi, StandardCopyOption.REPLACE_EXISTING);
+                    } else {
+                        List<String> fuseCmd = new java.util.ArrayList<>();
+                        fuseCmd.add(workDirectory.resolve("fuse_midis.exe").toString());
+                        fuseCmd.add("--primary");
+                        fuseCmd.add(mixMidi.toString());
+                        for (Path p : pool) {
+                            fuseCmd.add("--pool");
+                            fuseCmd.add(p.toString());
+                        }
+                        fuseCmd.add("--out");
+                        fuseCmd.add(mergedMidi.toString());
+                        fuseCmd.add("--tol");
+                        fuseCmd.add("0.12");
+                        fuseCmd.add("--semis");
+                        fuseCmd.add("0");
+                        run(jobDirectory, fuseCmd);
+                    }
+                } else {
+                    List<Path> midis = new java.util.ArrayList<>();
+                    for (Path stem : kept) {
+                        Path stemWav = normalize(stem, jobDirectory, "stem");
+                        Path midi = jobDirectory.resolve("stem_" + midis.size() + ".mid");
+                        run(jobDirectory, List.of(workDirectory.resolve("audio_to_midi.exe").toString(),
+                                stemWav.toString(), midi.toString()));
+                        midis.add(midi);
+                    }
+                    List<String> mergeCmd = new java.util.ArrayList<>();
+                    mergeCmd.add(workDirectory.resolve("merge_midis.exe").toString());
+                    midis.forEach(m -> mergeCmd.add(m.toString()));
+                    mergeCmd.add(mergedMidi.toString());
+                    run(jobDirectory, mergeCmd);
+                }
                 String splitMode = "bank".equalsIgnoreCase(split) ? "bank" : "pitch";
                 int cap = Math.max(1, Math.min(128, polyCap));
                 if (lanes > 0) {
@@ -206,7 +247,7 @@ public final class MusicToolRunner implements AutoCloseable {
                     run(jobDirectory, List.of(workDirectory.resolve("midi_to_nbt.exe").toString(),
                             mergedMidi.toString(), output.toString(),
                             "--seconds", String.format(Locale.ROOT, "%.6f", seconds),
-                            "--resolution", "2", "--layout", "simple"));
+                            "--resolution", "2", "--layout", "simple", "--poly-cap", "13"));
                 }
                 RedStoneMusic.LOGGER.info("多音轨转换完成: {}（引擎={}，保留 {} 轨，丢弃 {} 轨）",
                         output, engine, kept.size(), stemWavs.size() - kept.size());
@@ -237,10 +278,18 @@ public final class MusicToolRunner implements AutoCloseable {
             try {
                 Path midi = jobDirectory.resolve("online.mid");
                 new MuscriptorClient().transcribe(input, midi, progress);
+                // 在线模型会在开头补静音/补齐小节，这里把首个音符对齐到原曲实际起音
+                double lead = detectOnsetSeconds(input, jobDirectory,
+                    workDirectory.resolve("ffmpeg.exe"));
+                if (lead > 0.0) {
+                    progress.accept(String.format(Locale.ROOT,
+                        "对齐起始位置：首个音符 %.2fs", lead));
+                }
                 run(jobDirectory, List.of(workDirectory.resolve("arrange_multilane.exe").toString(),
                         "--midi", midi.toString(), "--out", output.toString(),
                         "--split", "instrument", "--lanes", "1", "--resolution", "2",
-                        "--poly-cap", "128", "--lane-gap", "2"));
+                        "--poly-cap", "128", "--lane-gap", "2",
+                        "--align-lead", String.format(Locale.ROOT, "%.3f", lead)));
                 RedStoneMusic.LOGGER.info("在线多乐器转换完成: {}", output);
                 return output;
             } catch (IOException e) {
@@ -252,6 +301,68 @@ public final class MusicToolRunner implements AutoCloseable {
                 deleteTree(jobDirectory);
             }
         }, executor);
+    }
+
+    /**
+     * 探测音频的首个有效起音时刻（秒）：解码为 22050Hz 单声道，按 25ms 帧算 RMS。
+     * 先用 0.08（约 -22 dBFS）定位真正的起音，找不到时退回 0.012 的弱门限，
+     * 避免淡入前奏被当成起音、也避免整体静音的素材得到 0。失败时返回 0。
+     */
+    static double detectOnsetSeconds(Path input, Path jobDirectory, Path ffmpeg) {
+        final int sampleRate = 22050;
+        final int hop = sampleRate * 25 / 1000;   // 551 采样 = 25ms
+        try {
+            Path mono = jobDirectory.resolve("onset.wav");
+            ProcessBuilder builder = new ProcessBuilder(List.of(ffmpeg.toString(),
+                    "-y", "-v", "error", "-i", input.toString(),
+                    "-ac", "1", "-ar", Integer.toString(sampleRate),
+                    "-c:a", "pcm_s16le", mono.toString()));
+            builder.directory(jobDirectory.toFile());
+            builder.redirectErrorStream(true);
+            Process process = builder.start();
+            process.getInputStream().readAllBytes();
+            if (process.waitFor() != 0) return 0.0;
+
+            byte[] buf = Files.readAllBytes(mono);
+            int dataPos = pcmDataOffset(buf);
+            if (dataPos < 0) return 0.0;
+            int frame = firstFrameAbove(buf, dataPos, hop, 0.08);
+            if (frame < 0) frame = firstFrameAbove(buf, dataPos, hop, 0.012);
+            return frame < 0 ? 0.0 : (double) frame * hop / sampleRate;
+        } catch (Exception e) {
+            RedStoneMusic.LOGGER.warn("起音探测失败，按 0 处理: {}", input, e);
+        }
+        return 0.0;
+    }
+
+    // 返回第一个 RMS 越过阈值的 25ms 帧序号，找不到返回 -1
+    private static int firstFrameAbove(byte[] buf, int dataPos, int hop, double threshold) {
+        int frame = 0;
+        for (int start = dataPos; start + hop * 2 <= buf.length; start += hop * 2, frame++) {
+            double energy = 0;
+            for (int i = 0; i < hop; i++) {
+                short v = (short) ((buf[start + i * 2] & 0xff) | ((buf[start + i * 2 + 1] & 0xff) << 8));
+                double d = v / 32768.0;
+                energy += d * d;
+            }
+            if (Math.sqrt(energy / hop) >= threshold) return frame;
+        }
+        return -1;
+    }
+
+    // 定位 WAV 的 data 块起点（跳过 fmt 等其它块）
+    private static int pcmDataOffset(byte[] buf) {
+        if (buf.length < 44 || buf[0] != 'R' || buf[1] != 'I' || buf[2] != 'F' || buf[3] != 'F') return -1;
+        int pos = 12;
+        while (pos + 8 <= buf.length) {
+            if (buf[pos] == 'd' && buf[pos + 1] == 'a' && buf[pos + 2] == 't' && buf[pos + 3] == 'a') {
+                return pos + 8;
+            }
+            int size = (buf[pos + 4] & 0xff) | ((buf[pos + 5] & 0xff) << 8)
+                    | ((buf[pos + 6] & 0xff) << 16) | ((buf[pos + 7] & 0xff) << 24);
+            pos += 8 + size + (size & 1);
+        }
+        return -1;
     }
 
     // 读取 WAV（16bit PCM / float32）计算左声道能量（用于音轨能量门限）

@@ -4,6 +4,8 @@ A Forge mod and local toolchain that converts ordinary audio into playable Minec
 
 AutoRedStoneMusic takes an MP3 or WAV file and turns it into a Minecraft Structure NBT file containing note blocks and redstone timing. The generated structure can be saved, shared, loaded again, and placed directly in front of the player from inside Minecraft.
 
+> **Update (2026-11-14)**: **Traditional pipeline rebuilt.** Separation now runs HPSS → REPET-SIM (kNN) → STFT-domain smooth crossovers, emitting three roles (`drums / bass / harmonic`). Transcription now runs once on the full mix plus once on harmonic and bass, then intersects them at note level with the new C++ tool `fuse_midis.exe` — about **+5.4 pp** top-1 over single-pass transcription with ~39% fewer note blocks. Also fixed WOLA edge spikes and a dust-run false positive; `midi_to_nbt` gained `--poly-cap`, and single-track transposition is now octave-only.
+
 > **Update (2026-11-08)**: Added **optional online multi-instrument transcription**. `Convert <song> online` sends the audio to a publicly deployed online model, receives an instrument-tagged MIDI, and generates an **instrument-per-lane structure** (lane count = number of instruments). A Yes/No confirmation appears in chat first; the command branch takes no extra parameters and places the structure automatically when finished.
 
 > **Update (2026-11-06)**: `midi_to_nbt.exe`, `arrange_multilane.exe`, and `merge_midis.exe` were **rewritten in C++17** from Python/PyInstaller. Their block/note output matches the originals exactly, with measured speedups of about **108× / 53× / 145×** and a **~54 MB** smaller mod JAR. Added a standalone **NTB → NBS (Note Block Studio)** exporter. The README now documents the full clone-to-build flow, including Git LFS.
@@ -37,6 +39,7 @@ AutoRedStoneMusic takes an MP3 or WAV file and turns it into a Minecraft Structu
 - **New: C++17 fast toolchain** — `midi_to_nbt`, `arrange_multilane`, and `merge_midis` were rewritten from Python/PyInstaller in C++17. Output matches the originals, speedups are about 53×–145×, and the mod JAR is about 54 MB smaller.
 - **New: NTB → NBS export** — the standalone C++ tool `ntb_to_nbs.exe` converts a generated structure into a Note Block Studio `.nbs` file (v4, 20 TPS) for inspection, editing, and sharing.
 - **New: optional online multi-instrument transcription** — `Convert <song> online` uses a publicly deployed online model, so no local inference model is needed. The result becomes an instrument-per-lane structure (`bass / harp / bell / basedrum`, lane count = number of instruments present). Uploading requires a Yes/No confirmation in chat; choosing No uploads nothing.
+- **New: three-role separation + note-level fusion (traditional engine)** — the traditional engine emits only `drums / bass / harmonic` (downstream only has basedrum/bass/harp/bell anyway). Transcription runs on the full mix plus harmonic and bass, and `fuse_midis` keeps only notes confirmed by a separated stem; the union is worse, the intersection keeps both recall and precision.
 
 ## Pipeline
 
@@ -66,7 +69,7 @@ Minecraft Structure NBT
 Forge places the structure in front of the player
 ```
 
-Multi-track (new) path:
+Multi-track (traditional engine, rebuilt 2026-11-14):
 
 ```text
 MP3/WAV
@@ -75,22 +78,26 @@ MP3/WAV
 FFmpeg normalizes to 44.1kHz stereo 16-bit PCM WAV
    |
    v
-Source separation (choose one)
-   ├─ ai  : demucs_mt.cpp.main.exe + htdemucs model (4 stems)
-   └─ trad: traditional_sep.exe (REPET-SIM + HPSS, 6 stems)
+traditional_sep.exe --roles
+   ├─ HPSS (17/17 median kernels): drums / harmonic
+   ├─ REPET-SIM (96 log bands + kNN similar-frame averaging): vocals / instrumental
+   └─ STFT-domain smooth crossovers: bass <250Hz, harmonic = the rest
    |
    v
-Energy threshold: drop stems with energy ratio < 1.5%
+Three role stems: drums / bass / harmonic (energy sums to 1, no overlap)
+   |
+   ├─ audio_to_midi.exe (full mix)   → mix.mid   recall
+   ├─ audio_to_midi.exe (harmonic)   → harm.mid  precision
+   └─ audio_to_midi.exe (bass)       → bass.mid
    |
    v
-Per-stem audio_to_midi.exe (Basic Pitch)
+fuse_midis.exe: keep mix notes that have a match in harm/bass (±0.12s, same pitch)
    |
    v
-merge_midis.exe merges into a single MIDI
-   |
-   v
-midi_to_nbt.exe single-bank three-tier mapping → Minecraft Structure NBT
+midi_to_nbt.exe --poly-cap 13 → Minecraft Structure NBT
 ```
+
+The AI engine (Demucs) still uses the per-stem transcription → `merge_midis` path.
 
 Multi-lane structure (optional, added 2026-10-31):
 
@@ -161,7 +168,8 @@ The project is split into the following independent Windows tools:
    - AI source separation (Demucs htdemucs, 4 stems), multi-threaded CPU C++ inference plus model weights.
 
 6. `traditional_sep.exe`
-   - Traditional separation (C++17 + Eigen, 6 stems, 7 threads).
+   - Traditional separation (C++17 + Eigen, 7 threads).
+   - `--roles` emits `drums / bass / harmonic`; otherwise it emits six fine-grained stems.
 
 7. `ntb_to_nbs.exe` (standalone, added 2026-11-06, not bundled in the mod)
    - NTB → Note Block Studio `.nbs` (v4, 20 TPS).
@@ -171,6 +179,10 @@ The project is split into the following independent Windows tools:
    - Submits audio to a publicly deployed online model, reads the returned multi-instrument MIDI, and feeds it to `arrange_multilane.exe --split instrument`.
    - Uses no local inference CPU/VRAM but requires network access; there is no local fallback, so the conversion fails when the service is unavailable.
    - The service address lives in the source of the online transcription client and can be replaced with another publicly deployed online service.
+
+9. `fuse_midis.exe` (C++17, added 2026-11-14)
+   - Note-level voting fusion: `--primary` is the full-mix transcription, `--pool` is a separated-stem transcription (repeatable); keeps primary notes that have a match in a pool (`--tol` seconds, `--semis` semitones).
+   - Source: `tools/some-onnx/cpp/fast_tools/fast_fuse_midis.cpp`.
 
 The mod calls these executables with `ProcessBuilder`, without JNI. Audio inference, source separation, and NBT generation are therefore decoupled from the Minecraft JVM, making the pipeline easier to test, replace, and extend. Online transcription is the only network path, and it requires explicit player confirmation in chat first.
 
@@ -202,12 +214,15 @@ redstonemusic/tools/
 ├── ggml-model-htdemucs-4s-f16.bin
 ├── traditional_sep.exe
 ├── merge_midis.exe
+├── fuse_midis.exe
 └── arrange_multilane.exe
 ```
 
 This `redstonemusic/tools/` path is created inside the temporary runtime workspace. Users do not need to create it manually.
 
 ## In-Game Commands
+
+> **Update (2026-11-14)**: Command syntax is unchanged, but `trad true` now uses three-role separation plus note-level fusion. Single-track and multi-track NBT generation both pass `--poly-cap 13` (keeps the highest notes instead of failing when a branch bus exceeds 15 blocks). Single-track transposition is now octave-only.
 
 > **Update (2026-11-08)**: `Convert` gained an `online` branch: `Convert <song> online`. It takes no other command parameters; it first asks in chat whether uploading the audio is allowed, converts online only after clicking Yes, then builds instrument lanes and places the structure automatically. Output file: `<name>_online_multi.ntb`.
 
@@ -262,6 +277,8 @@ Generated file names follow `<name>_<engine>_<multi-track>[_L<N>][_bank][_P<cap>
 
 ## Test Results
 
+> **Update (2026-11-14)**: Added the Ode to Joy 30-second comparison for the rebuilt traditional pipeline (six-stem / three-role / note-level fusion) plus separation metrics.
+
 > **Update (2026-10-31)**: Added a Canon (instrumental) 30-second single-track vs traditional-separation comparison and a 3-lane straight-structure measurement; added MIDI/NBT loss quantification tools and results. Structural support material is now smooth quartz.
 >
 > **Update (2026-10-11)**: Added multi-track structure tests (AI / traditional separation → energy threshold → per-stem MIDI → merge → single-bank three-tier) and a fidelity check for C++ traditional separation — recombining the separated stems reproduces the source audio with a correlation around 0.98, confirming the separation and write-out stages preserve fidelity.
@@ -310,6 +327,25 @@ C++ rewrite equivalence and speedups (2026-11-06):
 | `merge_midis` | 823.8 ms | 5.7 ms | **144.5×** |
 
 Timings include the old PyInstaller startup cost; results vary by machine. A re-test of `midi_to_nbt` measured about 1.49–1.70 s → 17.1–17.6 ms.
+
+Traditional pipeline rebuild (2026-11-14, Ode to Joy, first 30 s, 44.1kHz stereo):
+
+| Pipeline | Note blocks | Size | Global chroma | Top-1 | Top-3 |
+|---|---:|---|---:|---:|---:|
+| Single-pass full-mix transcription | 325 | 609×2×9 | 0.8570 | 37.5% | 76.3% |
+| Old traditional (6 stems, per-stem transcription) | 754 | 993×2×13 | 0.9175 | 30.8% | 71.4% |
+| 6 stems + new separation | 752 | 969×2×15 | 0.9114 | 34.4% | 72.6% |
+| 3 roles (drums/bass/harmonic) | 479 | 761×2×12 | 0.8800 | 33.4% | 70.8% |
+| **3 roles + note fusion (new default)** | **198** | **455×2×8** | **0.8919** | **42.9%** | **78.8%** |
+
+Separation metrics (same material):
+
+| Version | Vocals energy share | Reconstruction corr / residual | Bass centroid |
+|---|---:|---|---:|
+| Old (median REPET + filter band split) | 56.8% | 0.9948 / 0.0095 | 171Hz |
+| New (kNN REPET + STFT split + padded WOLA) | 13.5% | 0.9995 / 0.0022 | 103Hz |
+
+Fusion ablation (MIDI level, offset=0): union 37.8% < single-pass 38.5% < harmonic-only 43.5% < **intersection (harmonic∪bass) 44.9%**.
 
 The tests cover:
 
@@ -459,7 +495,8 @@ src/main/resources/                Mod metadata and runtime resources
  tools/some-onnx/cpp/               C++ inference source and build scripts
  tools/some-onnx/cpp/traditional_sep/   C++ traditional source separation
  tools/some-onnx/cpp/eigen/         Header-only Eigen library
- tools/some-onnx/cpp/fast_tools/    C++17 fast tools (midi_to_nbt / arrange_multilane / merge_midis)
+ tools/some-onnx/cpp/fast_tools/    C++17 fast tools (midi_to_nbt / arrange_multilane / merge_midis / fuse_midis)
+ tools/some-onnx/cpp/fast_tools/fast_fuse_midis.cpp   Note-level voting fusion (2026-11-14)
  tools/some-onnx/cpp/ntb_to_nbs/    NTB → NBS converter
  tools/some-onnx/src/               MIDI, NBT, and Python helper source
  tools/some-onnx/src/arrange_multilane.py   Final MIDI → multi-lane straight structure
@@ -479,7 +516,7 @@ This mod starts native programs on the server host. A Forge JAR should not be as
 
 ### Why executables and DLLs are extracted
 
-The JAR bundles fixed versions of `audio_to_midi.exe`, `midi_to_nbt.exe`, `arrange_multilane.exe`, `demucs_mt.cpp.main.exe`, `traditional_sep.exe`, `merge_midis.exe`, the Demucs model weights, FFmpeg, ONNX Runtime DLLs, and the `nmp.onnx` weights. During initialization, the mod copies these resources into a newly created `RedStoneMusic-*` working directory under the system temporary directory. Windows tools and DLLs need ordinary filesystem paths for execution and loading. These files are bundled resources, not downloaded from the network or extracted from song input. The mod launches the specified executables with `ProcessBuilder` argument lists rather than building a shell command string.
+The JAR bundles fixed versions of `audio_to_midi.exe`, `midi_to_nbt.exe`, `arrange_multilane.exe`, `fuse_midis.exe`, `demucs_mt.cpp.main.exe`, `traditional_sep.exe`, `merge_midis.exe`, the Demucs model weights, FFmpeg, ONNX Runtime DLLs, and the `nmp.onnx` weights. During initialization, the mod copies these resources into a newly created `RedStoneMusic-*` working directory under the system temporary directory. Windows tools and DLLs need ordinary filesystem paths for execution and loading. These files are bundled resources, not downloaded from the network or extracted from song input. The mod launches the specified executables with `ProcessBuilder` argument lists rather than building a shell command string.
 
 ### File access and cleanup scope
 
