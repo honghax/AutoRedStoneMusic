@@ -27,7 +27,6 @@ public final class MusicToolRunner implements AutoCloseable {
     private static final String DEMUCS_MODEL = "/redstonemusic/tools/ggml-model-htdemucs-4s-f16.bin";
     private static final String TRAD_EXE = "/redstonemusic/tools/traditional_sep.exe";
     private static final String MERGE_EXE = "/redstonemusic/tools/merge_midis.exe";
-    private static final String FUSE_EXE = "/redstonemusic/tools/fuse_midis.exe";
     private static final String MULTILANE_EXE = "/redstonemusic/tools/arrange_multilane.exe";
 
     private final Path workDirectory;
@@ -52,7 +51,6 @@ public final class MusicToolRunner implements AutoCloseable {
         // 传统算法分离（C++）与 MIDI 合并（多音轨流程资源）
         release(TRAD_EXE);
         release(MERGE_EXE);
-        release(FUSE_EXE);
         release(MULTILANE_EXE);
         Runtime.getRuntime().addShutdownHook(new Thread(this::close, "RedStoneMusic-tool-cleanup"));
     }
@@ -158,9 +156,8 @@ public final class MusicToolRunner implements AutoCloseable {
                     if (!Files.isRegularFile(trad)) {
                         throw new IllegalStateException("多音轨资源缺失：需要 traditional_sep.exe");
                     }
-                    // --roles：只输出 drums/bass/harmonic 三条，
-                    // 避免同一段旋律被 vocals/guitar/piano 各转写一次产生八度重复
-                    run(jobDirectory, List.of(trad.toString(), wav.toString(), stems.toString(), "--roles"));
+                    // 6 轨细分类：drums / bass / other / vocals / guitar / piano
+                    run(jobDirectory, List.of(trad.toString(), wav.toString(), stems.toString()));
                 }
 
                 // 收集分离产物（target_*.wav），按能量占比丢弃弱轨
@@ -186,56 +183,20 @@ public final class MusicToolRunner implements AutoCloseable {
 
                 // 逐轨转写 MIDI
                 Path mergedMidi = jobDirectory.resolve("merged.mid");
-                if (!ai) {
-                    // 传统引擎：全混音转写一次（召回）+ harmonic/bass 各转写一次（精度），
-                    // 再做音符级交集融合，避免"分轨转写把分离误差放大成伪音符"
-                    Path mixMidi = jobDirectory.resolve("mix.mid");
+                List<Path> midis = new java.util.ArrayList<>();
+                for (Path stem : kept) {
+                    Path stemWav = normalize(stem, jobDirectory, "stem");
+                    Path midi = jobDirectory.resolve("stem_" + midis.size() + ".mid");
                     run(jobDirectory, List.of(workDirectory.resolve("audio_to_midi.exe").toString(),
-                            wav.toString(), mixMidi.toString()));
-                    List<Path> pool = new java.util.ArrayList<>();
-                    for (Path stem : kept) {
-                        String name = stem.getFileName().toString();
-                        if (!name.contains("harmonic") && !name.contains("bass")) continue;
-                        Path midi = jobDirectory.resolve("pool_" + pool.size() + ".mid");
-                        run(jobDirectory, List.of(workDirectory.resolve("audio_to_midi.exe").toString(),
-                                stem.toString(), midi.toString()));
-                        pool.add(midi);
-                    }
-                    if (pool.isEmpty()) {
-                        // 没有可用的 harmonic/bass 轨时退回直接使用混音转写
-                        Files.copy(mixMidi, mergedMidi, StandardCopyOption.REPLACE_EXISTING);
-                    } else {
-                        List<String> fuseCmd = new java.util.ArrayList<>();
-                        fuseCmd.add(workDirectory.resolve("fuse_midis.exe").toString());
-                        fuseCmd.add("--primary");
-                        fuseCmd.add(mixMidi.toString());
-                        for (Path p : pool) {
-                            fuseCmd.add("--pool");
-                            fuseCmd.add(p.toString());
-                        }
-                        fuseCmd.add("--out");
-                        fuseCmd.add(mergedMidi.toString());
-                        fuseCmd.add("--tol");
-                        fuseCmd.add("0.12");
-                        fuseCmd.add("--semis");
-                        fuseCmd.add("0");
-                        run(jobDirectory, fuseCmd);
-                    }
-                } else {
-                    List<Path> midis = new java.util.ArrayList<>();
-                    for (Path stem : kept) {
-                        Path stemWav = normalize(stem, jobDirectory, "stem");
-                        Path midi = jobDirectory.resolve("stem_" + midis.size() + ".mid");
-                        run(jobDirectory, List.of(workDirectory.resolve("audio_to_midi.exe").toString(),
-                                stemWav.toString(), midi.toString()));
-                        midis.add(midi);
-                    }
-                    List<String> mergeCmd = new java.util.ArrayList<>();
-                    mergeCmd.add(workDirectory.resolve("merge_midis.exe").toString());
-                    midis.forEach(m -> mergeCmd.add(m.toString()));
-                    mergeCmd.add(mergedMidi.toString());
-                    run(jobDirectory, mergeCmd);
+                            stemWav.toString(), midi.toString()));
+                    midis.add(midi);
                 }
+                // 合并 MIDI → 单轨三档生成
+                List<String> mergeCmd = new java.util.ArrayList<>();
+                mergeCmd.add(workDirectory.resolve("merge_midis.exe").toString());
+                midis.forEach(m -> mergeCmd.add(m.toString()));
+                mergeCmd.add(mergedMidi.toString());
+                run(jobDirectory, mergeCmd);
                 String splitMode = "bank".equalsIgnoreCase(split) ? "bank" : "pitch";
                 int cap = Math.max(1, Math.min(128, polyCap));
                 if (lanes > 0) {
