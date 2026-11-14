@@ -286,6 +286,19 @@ Generated file names follow `<name>_<engine>_<multi-track>[_L<N>][_bank][_P<cap>
 >
 > **Update (2026-10-11)**: Added multi-track structure tests (AI / traditional separation → energy threshold → per-stem MIDI → merge → single-bank three-tier) and a fidelity check for C++ traditional separation — recombining the separated stems reproduces the source audio with a correlation around 0.98, confirming the separation and write-out stages preserve fidelity.
 
+> **Update (2026-11-14)**: Added a "Limitations of the Metrics" note — the numbers are systematically biased and are reference-only; listening decides.
+
+### Limitations of the Metrics
+
+The chroma / top-1 / top-3 numbers used in this repo are **systematically biased and only partially meaningful**:
+
+- **They do not penalize missed notes.** Top-1/top-3 only ask whether that pitch class is present in the reference frame, so dropping uncertain notes immediately raises the score.
+- **They ignore musical information.** Chroma only reflects pitch-class distribution — not octave, duration, velocity, or timbre.
+- **They are sensitive to time alignment.** The default window is 0.1 s; pipelines are only comparable when aligned the same way, and a 0.1 s misalignment can move top-1 from ~10% to ~40%.
+- **Evidence:** the three-role + note-fusion variant scored highest (top-1 42.9%) yet sounded clearly thinner than the six-stem merge.
+
+Conclusion: these metrics are only for **longitudinal comparison on the same material with the same alignment**. Whether something sounds right must be judged by listening.
+
 The conversion time below means the complete pipeline from input audio through decoding, ONNX inference, MIDI writing, NBT generation, and final output completion.
 
 | Test song | Full conversion time | Test coverage |
