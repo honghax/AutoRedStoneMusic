@@ -4,6 +4,8 @@
 
 AutoRedStoneMusic 的目标，是把一首歌曲从普通音频文件直接变成可以在 Minecraft 世界中放置、播放和分享的红石音乐结构。用户只需要把 MP3 或 WAV 放入指定目录，即可在游戏内调用转换工具，生成 `.nbt` 结构并放置到玩家面前。
 
+> **本次更新（2026-11-16）**：在线链路新增**可选乐器提示**（`Convert <歌名> online inst`），按音符盒音色家族强制分离。垫块从 4 种扩到**16 种原版音色**（bass / didgeridoo / guitar / banjo / harp / bit / flute / xylophone / iron_xylophone / cow_bell / bell / chime / pling + basedrum / snare / hat），GM program 与鼓键位自动映射；起始总线改为**分段中继器 + 按轨补列**，6~8 条轨也能在同一 tick 起播；转换结果放置后会在结构末端自动生成**返回按钮**（命令方块 + 石按钮，一键传回起点）。
+
 > **本次更新（2026-11-14）**：**分离算法重写**。改为 HPSS → REPET-SIM(kNN) → STFT 域平滑交叉分频，修掉 WOLA 边界尖峰和红石粉长度误报；`midi_to_nbt` 新增 `--poly-cap`，单轨移调改为整八度。曾试验过“三角色分离 + 音符级融合”，量化指标更好但实际听感变薄，**已回滚**，传统链路仍为 6 轨逐轨转写后合并。
 
 > **本次更新（2026-11-08）**：新增**在线多乐器转写**（可选联网）。`Convert <歌名> online` 会把音频交给公开部署的在线模型转写，得到带乐器信息的 MIDI，再直接生成**按乐器分轨的多轨结构**（轨道数 = 乐器数）。执行命令后聊天栏会先询问是否允许上传，点「是」才开始；该分支固定参数、不接受其它命令参数，转换完成自动放置。
@@ -38,7 +40,11 @@ AutoRedStoneMusic 的目标，是把一首歌曲从普通音频文件直接变�
 - **新增：统一建筑材质**——所有结构支撑/条带间隔方块改为 `minecraft:smooth_quartz`，仅保留音符盒正下方的乐器垫块（`dirt` / `bamboo_planks` / `gold_block`）以及折叠布局中功能性必需的 `glowstone`。
 - **新增：C++17 快速工具链**——`midi_to_nbt` / `arrange_multilane` / `merge_midis` 已从 Python/PyInstaller 重写为 C++17，输出与原版一致，速度提升约 53×~145×，模组 JAR 缩小约 54 MB。
 - **新增：NTB → NBS 导出**——独立 C++ 工具 `ntb_to_nbs.exe` 可把已生成的红石结构转换为 Note Block Studio 的 `.nbs`（v4，20 TPS），便于在 NBS 中查看、编辑和二次分享。
-- **新增：在线多乐器转写（可选联网）**——`Convert <歌名> online` 使用公开部署的在线模型完成多乐器转写，不需要本机运行推理模型；结果直接生成按乐器分轨的多轨结构（`bass / harp / bell / basedrum`，轨道数 = 实际出现的乐器数）。上传前需在聊天栏点「是」确认，点「否」不会上传任何文件。
+- **新增：在线多乐器转写（可选联网）**——`Convert <歌名> online` 使用公开部署的在线模型完成多乐器转写，不需要本机运行推理模型；结果直接生成按乐器分轨的多轨结构（轨道数 = 实际出现的乐器数）。上传前需在聊天栏点「是」确认，点「否」不会上传任何文件。
+- **新增：可选乐器提示（`online inst`）**——默认由在线模型自行判断乐器；加 `inst` 才发送乐器提示，让模型按音符盒可用的音色家族强制分离。民族乐器、独奏等素材建议不加，避免被硬塞进不匹配的音色。
+- **新增：16 种原版音符盒音色**——除原有的 bass / harp / bell / basedrum 外，新增 didgeridoo / guitar / banjo / bit / flute / xylophone / iron_xylophone / cow_bell / chime / pling / snare / hat，每种音色自动使用对应的垫块与基准音，GM program 与鼓键位自动映射到最接近的音色。
+- **新增：分段起始总线 + 按轨补列**——红石粉 0 延迟上限 15 格，超出后每 14 格插入一个中继器（延迟 = 1 列），靠前的轨补空列，所有轨道仍在同一 tick 起播；按乐器严格分轨出现 6~8 条轨时不再需要把 bell 并进 harp。
+- **新增：末端返回按钮**——放置结构后自动在终点灯后补一个命令方块 + 石按钮，点击即用相对坐标传送回拉杆起点；不写入 NBT，结构文件保持原样。
 - **新增：传统分离算法重写**——HPSS 先行做打击/谐波拆分，vocals 用 kNN REPET-SIM（96 对数频带相似帧平均）软掩蔽，分频改到 STFT 域做平滑交叉并补零消除边界尖峰；6 轨输出保持不变，逐轨转写后合并。
 
 ## 工作流程
@@ -122,7 +128,7 @@ N 条平行直排红石轨道（各自 repeater + 支线 + 音符盒）
 Minecraft Structure NBT
 ```
 
-在线多乐器（2026-11-08 新增，可选，需要联网）：
+在线多乐器（2026-11-08 新增，可选，需要联网；2026-11-16 支持 `inst` 乐器提示）：
 
 ```text
 MP3/WAV
@@ -131,19 +137,19 @@ MP3/WAV
 玩家确认允许上传
    |
    v
-公开部署的在线模型（多乐器转写）
+公开部署的在线模型（多乐器转写；`online inst` 时附带乐器提示）
    |
    v
 多乐器 MIDI（每件乐器保留独立的轨道 / program 信息）
    |
    v
 arrange_multilane.exe --split instrument
-   ├─ 按乐器分轨：bass / harp / bell / basedrum
-   ├─ 轨道数 = 乐器数
-   └─ 超出共享总线距离时：bell 并入 harp
+   ├─ GM program / 鼓键位 → 16 种音符盒音色
+   ├─ 轨道数 = 实际出现的音色数（常见 6~8 条）
+   └─ 起始总线每 14 格插一个中继器，靠前的轨补空列对齐起播
    |
    v
-共享起始总线 + Minecraft Structure NBT（自动放置）
+共享起始总线 + Minecraft Structure NBT（自动放置，末端附返回按钮）
 ```
 
 项目由以下独立的 Windows 工具组成：
@@ -225,6 +231,8 @@ redstonemusic/tools/
 
 ## 游戏内命令
 
+> **本次更新（2026-11-16）**：`online` 分支新增可选子节点 `inst`：`Convert <歌名> online inst` 会附带乐器提示，按 16 种音符盒音色强制分轨；不写 `inst` 时仍由在线模型自行判断。所有转换结果放置后都会在结构末端生成命令方块 + 石按钮的返回点（需开启命令方块/作弊）。
+
 > **本次更新（2026-11-14）**：命令语法未变。`trad true` 使用重写后的分离算法（仍是 6 轨逐轨转写后合并）；单轨/多轨 NBT 生成统一带 `--poly-cap 13`（单列超限保留高音，避免支线总线超过 15 格报错）；单轨移调改为整八度。
 
 > **本次更新（2026-11-08）**：`Convert` 新增 `online` 分支：`Convert <歌名> online`。该分支不接受其它命令参数；执行后先在聊天栏询问是否允许上传音频，点「是」才联网转写，随后按乐器分轨并自动放置。生成文件名为 `<原名>_online_multi.ntb`。
@@ -252,6 +260,7 @@ redstonemusic/tools/
 /RedStoneMusic Convert song.mp3 true lanes 3 poly 8
 /RedStoneMusic Convert song.mp3 trad true lanes 3 split bank poly 12
 /RedStoneMusic Convert song.mp3 online
+/RedStoneMusic Convert song.mp3 online inst
 /RedStoneMusic place song.ntb
 /RedStoneMusic debug place <structure>
 ```
@@ -274,11 +283,41 @@ redstonemusic/tools/
 - `Convert song.mp3 lanes 3 split bank`：按 `bass / harp / bell` 音色分轨，而不是按音高均衡分轨。
 - `Convert song.mp3 true lanes 3 ...`：先做 AI 多音轨分离，再把合并后的最终 MIDI 生成 3 轨结构。
 - `Convert song.mp3 trad true lanes 3 ...`：传统分离 + 3 轨结构。
-- `Convert song.mp3 online`：使用公开部署的在线模型做**多乐器转写**，生成**按乐器分轨的多轨结构**（轨道数 = 乐器数，`bass / harp / bell / basedrum`），完成后自动放置。该命令不接受其它参数；执行后聊天栏会弹出「是 / 否」确认，只有点「是」才会上传音频。需要联网，且不含本地回退。
+- `Convert song.mp3 online`：使用公开部署的在线模型做**多乐器转写**，生成**按乐器分轨的多轨结构**（轨道数 = 乐器数），完成后自动放置。该命令不接受其它参数；执行后聊天栏会弹出「是 / 否」确认，只有点「是」才会上传音频。需要联网，且不含本地回退。
+- `Convert song.mp3 online inst`：同上，但附带**乐器提示**，让模型按音符盒可用的音色家族强制分离，便于吃满 16 种垫块；民族乐器等素材建议不加。
 
-生成文件名为 `<原名>_<引擎>_<是否多轨>[_L<N>][_bank][_P<cap>].ntb`，例如：单轨 AI 转换 `a_ai_false.ntb`、传统多轨转换 `a_trad_true.ntb`、3 轨 pitch/poly20 `a_ai_false_L3.ntb`、3 轨 bank/poly8 `a_ai_false_L3_bank_P8.ntb`。在线转换输出 `<原名>_online_multi.ntb`。输入文件只允许使用配置目录下的单个文件名，模组会检查扩展名并阻止路径穿越。
+生成文件名为 `<原名>_<引擎>_<是否多轨>[_L<N>][_bank][_P<cap>].ntb`，例如：单轨 AI 转换 `a_ai_false.ntb`、传统多轨转换 `a_trad_true.ntb`、3 轨 pitch/poly20 `a_ai_false_L3.ntb`、3 轨 bank/poly8 `a_ai_false_L3_bank_P8.ntb`。在线转换输出 `<原名>_online_multi.ntb`，带乐器提示时为 `<原名>_online_multi_inst.ntb`。输入文件只允许使用配置目录下的单个文件名，模组会检查扩展名并阻止路径穿越。
+
+放置完成后，结构末端（终点灯后）会多出一个命令方块和石按钮，点击按钮即可传送回拉杆起点；命令方块未启用（单人未开作弊、服务器 `enable-command-block=false`）时按钮不会生效。
+
+## 音符盒音色与垫块（2026-11-16 扩充）
+
+每种音色的可用音域固定为 25 个半音（两个八度 + 1），超出部分按 ±12 折回。
+
+| 音色 | 垫块 | 基准音（note 0） |
+| --- | --- | --- |
+| bass | `bamboo_planks` | F#1 |
+| didgeridoo | `pumpkin` | F#1 |
+| guitar | `white_wool` | F#2 |
+| banjo | `hay_block` | F#3 |
+| harp | `dirt` | F#3 |
+| bit | `emerald_block` | F#3 |
+| flute | `clay` | F#4 |
+| xylophone | `bone_block` | F#4 |
+| iron_xylophone | `iron_block` | F#4 |
+| cow_bell | `soul_sand` | F#4 |
+| bell | `gold_block` | F#5 |
+| chime | `packed_ice` | F#5 |
+| pling | `glowstone` | F#5 |
+| basedrum | `stone` | 无音高（note 固定 0） |
+| snare | `sand` | 无音高（note 固定 0） |
+| hat | `glass` | 无音高（note 固定 0） |
+
+GM program 与鼓键位按家族映射到上表音色：钢琴/弦乐/人声 → harp，吉他 → guitar，贝斯 → bass，铜管 → didgeridoo，簧管/管乐 → flute，色彩打击 → xylophone，合成主音 → bit，合成铺底 → pling，民族乐器 → banjo，定音鼓 → basedrum。
 
 ## 测试结果
+
+> **本次更新（2026-11-16）**：补充 8 轨乐器分轨实测与分段总线同步校验。
 
 > **本次更新（2026-11-14）**：新增欢乐颂前 30 秒的传统链路重构对比（6 轨 / 3 角色 / 音符级融合），以及分离环节的客观指标。
 
@@ -298,6 +337,19 @@ redstonemusic/tools/
 - **实证**：三角色 + 音符融合方案在指标上最高（top1 42.9%），但实际试听比 6 轨合并明显更薄。
 
 结论：指标只能用于**同素材、同对齐条件下的纵向对比**，判断“好不好听”必须以实际试听为准。
+
+### 乐器分轨与总线分段（2026-11-16）
+
+| 项目 | 结果 |
+| --- | --- |
+| 在线多乐器转写（带乐器提示，8 轨素材） | 8 条轨、2342 个音符盒 |
+| 音色分布 | bass 186 / guitar 973 / bit 35 / flute 80 / xylophone 311 / basedrum 115 / snare 90 / hat 552 |
+| 结构自校验 | 尺寸 2703×2×53，不可达 0、音符盒贴粉 0 |
+| 分段总线（4 轨，z=±71） | 中继器 8 个，延迟 8/2/2/8，靠前轨补列 0/6/6/0，不可达 0 |
+| 分段总线（3 轨，z=±28） | 每侧 1 个中继器，不可达 0 |
+| 无中继器回归（4 轨，z=±14） | 方块与音符盒数量与改动前完全一致 |
+
+以上结构均在游戏内实机试听确认同步正常。
 
 下面的“转换耗时”指从输入音频开始，经由音频解码、ONNX 推理、MIDI 生成、NBT 生成到结果文件完成的全流程耗时。
 

@@ -59,18 +59,46 @@ struct InstrumentLane {
     std::map<int, std::vector<MappedNote>> cols;
     int peak = 0;
     int z = 0;
+    int bus_delay_cols = 0;   // 起始总线到本轨累积的中继器延迟（列）
+    int pad_cols = 0;         // 为对齐起播额外补的空列
 };
 
-const char* const FAMILY_MAP[16] = {
-    "pno", "pno", "pad", "lead", "bass", "pad", "pad", "lead",
-    "lead", "lead", "lead", "pad", "pad", "lead", "drum", "drum"
+// ---------------------------------------------------------------------------
+// 原版 16 种音符盒音色：垫块 + 基准音（note=0 时的绝对音高）。
+// 每个音色的有效音域固定为 25 个半音（两个八度 + 1），超出按 ±12 折回。
+// 数组顺序即轨道排布顺序（低音在前，打击乐在后）。
+// ---------------------------------------------------------------------------
+struct McInstrument {
+    const char* name;
+    const char* material;
+    int base;
 };
 
-const Bank LANE_BANKS[3] = {
+const McInstrument MC_INSTRUMENTS[] = {
     {"bass", "minecraft:bamboo_planks", 30},
+    {"didgeridoo", "minecraft:pumpkin", 30},
+    {"guitar", "minecraft:white_wool", 42},
+    {"banjo", "minecraft:hay_block", 54},
     {"harp", "minecraft:dirt", 54},
+    {"bit", "minecraft:emerald_block", 54},
+    {"flute", "minecraft:clay", 66},
+    {"xylophone", "minecraft:bone_block", 66},
+    {"iron_xylophone", "minecraft:iron_block", 66},
+    {"cow_bell", "minecraft:soul_sand", 66},
     {"bell", "minecraft:gold_block", 78},
+    {"chime", "minecraft:packed_ice", 78},
+    {"pling", "minecraft:glowstone", 78},
+    {"basedrum", "minecraft:stone", 0},
+    {"snare", "minecraft:sand", 0},
+    {"hat", "minecraft:glass", 0},
 };
+
+const McInstrument* findInstrument(const std::string& name) {
+    for (const auto& mc : MC_INSTRUMENTS) {
+        if (name == mc.name) return &mc;
+    }
+    return nullptr;
+}
 
 std::string toLower(std::string s) {
     std::transform(s.begin(), s.end(), s.begin(),
@@ -78,30 +106,60 @@ std::string toLower(std::string s) {
     return s;
 }
 
-std::string classifyRole(int channel, int program, const std::string& track_name) {
-    if (channel == 9 || toLower(track_name).find("drum") != std::string::npos) return "drum";
-    int family = program / 8;
-    if (family < 0 || family > 15) family = 3;
-    return FAMILY_MAP[family];
+// GM 打击乐键位 → 三种打击音色
+std::string drumFamily(int pitch) {
+    if (pitch == 35 || pitch == 36) return "basedrum";
+    if (pitch >= 37 && pitch <= 40) return "snare";
+    if (pitch == 41 || pitch == 43 || pitch == 45 || pitch == 47 ||
+        pitch == 48 || pitch == 50) return "basedrum";   // 桶鼓并入底鼓
+    if (pitch == 42 || pitch == 44 || pitch == 46 || pitch == 49 ||
+        pitch == 51 || pitch == 52 || pitch == 53 || pitch == 55 ||
+        pitch == 54 || pitch == 56 || pitch == 57 || pitch == 59) return "hat";
+    return "hat";
+}
+
+// GM program → MC 音色；同家族共用一个音色（如钢琴/弦乐/人声都落 harp）
+std::string mcForProgram(int program) {
+    if (program < 0 || program > 127) return "harp";
+    if (program < 8) return "harp";                    // 钢琴
+    if (program < 16) return "xylophone";              // 色彩打击
+    if (program < 24) return "harp";                   // 风琴
+    if (program < 32) return "guitar";                 // 吉他
+    if (program < 40) return "bass";                   // 贝斯
+    if (program < 48) return program == 43 ? "bass" : "harp";  // 弦乐，低音提琴落 bass
+    if (program < 56) {
+        if (program == 47) return "basedrum";          // 定音鼓
+        if (program == 55) return "snare";             // 管弦乐齐奏
+        return "harp";                                 // 合奏/人声
+    }
+    if (program < 64) return "didgeridoo";             // 铜管
+    if (program < 72) return "flute";                  // 簧管
+    if (program < 80) return "flute";                  // 管乐
+    if (program < 88) return "bit";                    // 合成主音
+    if (program < 104) return "pling";                 // 合成铺底/音效
+    if (program < 112) return "banjo";                 // 民族乐器
+    if (program < 120) return "xylophone";             // 打击乐
+    return "pling";
+}
+
+std::string classifyRole(int channel, int program, const std::string& track_name, int pitch) {
+    if (channel == 9 || toLower(track_name).find("drum") != std::string::npos) {
+        return drumFamily(pitch);
+    }
+    return mcForProgram(program);
 }
 
 MappedNote mapRoleNote(const RoleNote& n, int shift) {
-    if (n.role == "drum") return MappedNote{"basedrum", "minecraft:stone", 0};
-    int q = n.pitch + shift;
-    const Bank* b = nullptr;
-    if (n.role == "bass") {
-        b = &LANE_BANKS[0];
-    } else if (q < 54) {
-        b = &LANE_BANKS[0];
-    } else if (q > 78) {
-        b = &LANE_BANKS[2];
-    } else {
-        b = &LANE_BANKS[1];
+    const McInstrument* mc = findInstrument(n.role);
+    if (mc == nullptr) mc = findInstrument("harp");
+    if (mc->base == 0) {
+        // 打击乐没有音高概念：底鼓固定 note 0，军鼓/踩镲也统一 0
+        return MappedNote{mc->name, mc->material, 0};
     }
-    int v = q - b->base;
+    int v = n.pitch + shift - mc->base;
     while (v < 0) v += 12;
     while (v > 24) v -= 12;
-    return MappedNote{b->inst, b->mat, v};
+    return MappedNote{mc->name, mc->material, v};
 }
 
 void loadRoleNotes(const MidiFileData& midi, std::vector<RoleNote>& out) {
@@ -129,7 +187,8 @@ void loadRoleNotes(const MidiFileData& midi, std::vector<RoleNote>& out) {
                     pending.erase(it);
                     if (now > start) {
                         out.push_back(RoleNote{ev.note, start, now,
-                                               classifyRole(ev.channel, prog, track.name)});
+                                               classifyRole(ev.channel, prog, track.name,
+                                                            ev.note)});
                     }
                 }
             }
@@ -171,6 +230,74 @@ void layoutInstrumentLanes(std::vector<InstrumentLane>& lanes, int gap, int& bus
         lane.z += shift;
         bus_half = std::max(bus_half, std::abs(lane.z));
     }
+}
+
+// ---------------------------------------------------------------------------
+// 起始总线分段：红石粉 0 延迟只能传 15 格，超过后每段接一个中继器。
+// 中继器延迟设为 resolution/2（1..4 档），正好等于 1 列，便于按列补齐。
+// 注意：中继器不能放在某条轨自己的 z 上（那会顶掉该轨的接入点），
+// 也不能让两段之间超过 15 格红石粉。
+// ---------------------------------------------------------------------------
+constexpr int BUS_SEG = 14;                    // 一段红石粉的目标长度
+
+std::vector<int> planBusRepeaters(int span, const std::set<int>& lane_z) {
+    std::vector<int> reps;
+    for (int dir : {1, -1}) {
+        int run = 0;
+        for (int d = 1; d <= span; ++d) {
+            int z = dir * d;
+            bool is_lane = lane_z.count(z) > 0;
+            bool next_lane = lane_z.count(z + dir) > 0;
+            bool need = run >= BUS_SEG || (run >= BUS_SEG - 1 && next_lane);
+            if (!is_lane && need && d < span) {
+                reps.push_back(z);
+                run = 0;
+            } else {
+                ++run;
+            }
+        }
+    }
+    std::sort(reps.begin(), reps.end());
+    return reps;
+}
+
+int busDelayBefore(const std::vector<int>& reps, int z) {
+    int a = std::abs(z);
+    int n = 0;
+    for (int p : reps) {
+        if (std::abs(p) < a) ++n;
+    }
+    return n;
+}
+
+void buildStartBus(BlockMap& merged, int z_min, int z_max, const std::vector<int>& reps,
+                   int repeaterDelay) {
+    const std::set<int> rep_set(reps.begin(), reps.end());
+    for (int z = z_min; z <= z_max; ++z) {
+        if (rep_set.count(z)) {
+            std::map<std::string, std::string> props;
+            // 模拟器约定：facing 指向输入侧（与 gen_machine 的折叠布线一致）
+            props["facing"] = z > 0 ? "north" : "south";
+            props["delay"] = std::to_string(repeaterDelay);
+            props["locked"] = "false";
+            props["powered"] = "false";
+            merged[Pos{-2, 1, z}] = Block{"minecraft:repeater", props};
+        } else {
+            std::map<std::string, std::string> wire_props;
+            wire_props["power"] = "0";
+            merged[Pos{-2, 1, z}] = Block{"minecraft:redstone_wire", wire_props};
+        }
+        merged.emplace(Pos{-2, 0, z}, Block{"minecraft:smooth_quartz", {}});
+    }
+}
+
+// 把某条轨的内容整体后移 pad 列，使所有轨在同一 tick 起播。
+template <typename ColMap>
+void padColumns(ColMap& cols, int pad) {
+    if (pad <= 0) return;
+    ColMap shifted;
+    for (auto& kv : cols) shifted[kv.first + pad] = std::move(kv.second);
+    cols = std::move(shifted);
 }
 
 int runInstrumentSplit(const std::string& midi_path, const std::string& out_path,
@@ -225,11 +352,11 @@ int runInstrumentSplit(const std::string& midi_path, const std::string& out_path
     }
 
     std::vector<InstrumentLane> lanes;
-    for (const char* name : {"bass", "harp", "bell", "basedrum"}) {
-        auto it = lane_cols.find(name);
+    for (const auto& mc : MC_INSTRUMENTS) {
+        auto it = lane_cols.find(mc.name);
         if (it == lane_cols.end()) continue;
         InstrumentLane lane;
-        lane.inst = name;
+        lane.inst = mc.name;
         lane.cols = std::move(it->second);
         for (auto& kv : lane.cols) dedupeColumn(kv.second);
         refreshPeak(lane);
@@ -242,27 +369,27 @@ int runInstrumentSplit(const std::string& midi_path, const std::string& out_path
 
     int bus_half = 0;
     layoutInstrumentLanes(lanes, lane_gap, bus_half);
-    if (bus_half > 14) {
-        // 总线是 0 延迟红石粉，最远轨道须 <=14 格；超限时把 bell 轨并入其它轨
-        auto bell = std::find_if(lanes.begin(), lanes.end(),
-                                 [](const InstrumentLane& l) { return l.inst == "bell"; });
-        if (bell != lanes.end() && lanes.size() > 1) {
-            auto target = std::find_if(lanes.begin(), lanes.end(),
-                                       [](const InstrumentLane& l) { return l.inst == "harp"; });
-            if (target == lanes.end()) {
-                target = std::find_if(lanes.begin(), lanes.end(),
-                    [](const InstrumentLane& l) { return l.inst != "bell"; });
-            }
-            for (const auto& kv : bell->cols) {
-                auto& dst = target->cols[kv.first];
-                dst.insert(dst.end(), kv.second.begin(), kv.second.end());
-            }
-            for (auto& kv : target->cols) dedupeColumn(kv.second);
-            refreshPeak(*target);
-            lanes.erase(bell);
-            layoutInstrumentLanes(lanes, lane_gap, bus_half);
-        }
+
+    // 分段总线：每个中继器延迟 resolution/2 tick = 恰好 1 列；
+    // 靠前的轨按延迟差补空列，保证所有轨从同一 tick 起播。
+    const int bus_rep_delay = std::max(1, std::min(4, resolution / 2));
+    std::set<int> lane_z;
+    int bus_span = 0;
+    for (const auto& lane : lanes) {
+        lane_z.insert(lane.z);
+        bus_span = std::max(bus_span, std::abs(lane.z));
     }
+    std::vector<int> bus_reps = planBusRepeaters(bus_span, lane_z);
+    int max_delay_cols = 0;
+    for (auto& lane : lanes) {
+        lane.bus_delay_cols = busDelayBefore(bus_reps, lane.z);
+        max_delay_cols = std::max(max_delay_cols, lane.bus_delay_cols);
+    }
+    for (auto& lane : lanes) {
+        lane.pad_cols = max_delay_cols - lane.bus_delay_cols;
+        padColumns(lane.cols, lane.pad_cols);
+    }
+    columns += max_delay_cols;
 
     std::set<int> union_set;
     for (const auto& lane : lanes) {
@@ -303,12 +430,7 @@ int runInstrumentSplit(const std::string& midi_path, const std::string& out_path
     obs_props["facing"] = "west";
     obs_props["powered"] = "false";
     merged[Pos{-3, 1, 0}] = Block{"minecraft:observer", obs_props};
-    for (int z = z_min; z <= z_max; ++z) {
-        std::map<std::string, std::string> wire_props;
-        wire_props["power"] = "0";
-        merged[Pos{-2, 1, z}] = Block{"minecraft:redstone_wire", wire_props};
-        merged.emplace(Pos{-2, 0, z}, Block{"minecraft:smooth_quartz", {}});
-    }
+    buildStartBus(merged, z_min, z_max, bus_reps, bus_rep_delay);
     for (int x : {-4, -3}) {
         merged.emplace(Pos{x, 0, 0}, Block{"minecraft:smooth_quartz", {}});
     }
@@ -332,17 +454,20 @@ int runInstrumentSplit(const std::string& midi_path, const std::string& out_path
     bus_half = std::max(std::abs(z_min), std::abs(z_max));
 
     std::printf("notes=%zu lanes=%zu columns=%d blocks=%zu note_blocks=%zu "
-                "dropped=%zu unreachable=%zu adjacency=%zu size=%d,%d,%d bus_half=%d\n",
+                "dropped=%zu unreachable=%zu adjacency=%zu size=%d,%d,%d bus_half=%d "
+                "bus_rep_delay=%d bus_delay_cols=%d\n",
                 notes.size(), lanes.size(), columns, merged.size(), note_count,
-                dropped, unreachable, adjacency.size(), sx, sy, sz, bus_half);
+                dropped, unreachable, adjacency.size(), sx, sy, sz, bus_half,
+                bus_rep_delay, max_delay_cols);
     for (const auto& lane : lanes) {
         int lane_notes = 0;
         for (const auto& kv : lane.cols) {
             lane_notes += static_cast<int>(kv.second.size());
         }
-        std::printf("lane %s: z=%+d notes=%d columns=%d peak=%d\n",
+        std::printf("lane %s: z=%+d notes=%d columns=%d peak=%d bus_delay=%d pad=%d\n",
                     lane.inst.c_str(), lane.z, lane_notes,
-                    static_cast<int>(lane.cols.size()), lane.peak);
+                    static_cast<int>(lane.cols.size()), lane.peak,
+                    lane.bus_delay_cols, lane.pad_cols);
     }
 
     if (!json_path.empty()) {
@@ -359,6 +484,8 @@ int runInstrumentSplit(const std::string& midi_path, const std::string& out_path
             jf << "  \"unreachable_note_blocks\": " << unreachable << ",\n";
             jf << "  \"note_dust_adjacency\": " << adjacency.size() << ",\n";
             jf << "  \"bus_max_distance\": " << bus_half << ",\n";
+            jf << "  \"bus_repeater_delay\": " << bus_rep_delay << ",\n";
+            jf << "  \"bus_delay_columns\": " << max_delay_cols << ",\n";
             jf << "  \"lanes\": {\n";
             bool first = true;
             for (const auto& lane : lanes) {
@@ -366,7 +493,9 @@ int runInstrumentSplit(const std::string& midi_path, const std::string& out_path
                 first = false;
                 jf << "    \"" << jsonEscape(lane.inst) << "\": {\"z_offset\": " << lane.z
                    << ", \"used_columns\": " << lane.cols.size()
-                   << ", \"max_per_col\": " << lane.peak << "}";
+                   << ", \"max_per_col\": " << lane.peak
+                   << ", \"bus_delay_cols\": " << lane.bus_delay_cols
+                   << ", \"pad_cols\": " << lane.pad_cols << "}";
             }
             jf << "\n  }\n}\n";
         }
@@ -587,12 +716,6 @@ int main(int argc, char** argv) {
             return 1;
         }
 
-        std::set<int> union_set;
-        for (const auto& kv : lane_data) {
-            for (const auto& c : kv.second.col_notes) union_set.insert(c.first);
-        }
-        std::vector<int> union_cols(union_set.begin(), union_set.end());
-
         int base_pitch = 2 + std::max(1, global_max_per_col) + 1;
         int lane_width = base_pitch + lane_gap;
         std::vector<int> offsets(static_cast<std::size_t>(lanes));
@@ -601,6 +724,33 @@ int main(int argc, char** argv) {
             offsets[static_cast<std::size_t>(i)] =
                 pyRound((static_cast<double>(i) - mid) * static_cast<double>(lane_width));
         }
+
+        // 分段总线 + 按轨补齐，保证多轨同一 tick 起播
+        const int bus_rep_delay = std::max(1, std::min(4, resolution / 2));
+        std::set<int> lane_z;
+        int bus_span = 0;
+        for (int off : offsets) {
+            lane_z.insert(off);
+            bus_span = std::max(bus_span, std::abs(off));
+        }
+        std::vector<int> bus_reps = planBusRepeaters(bus_span, lane_z);
+        int max_delay_cols = 0;
+        for (const auto& kv : lane_data) {
+            max_delay_cols = std::max(max_delay_cols,
+                busDelayBefore(bus_reps, offsets[static_cast<std::size_t>(kv.first)]));
+        }
+        for (auto& kv : lane_data) {
+            int pad = max_delay_cols -
+                busDelayBefore(bus_reps, offsets[static_cast<std::size_t>(kv.first)]);
+            padColumns(kv.second.col_notes, pad);
+            kv.second.z_offset = offsets[static_cast<std::size_t>(kv.first)];
+        }
+
+        std::set<int> union_set;
+        for (const auto& kv : lane_data) {
+            for (const auto& c : kv.second.col_notes) union_set.insert(c.first);
+        }
+        std::vector<int> union_cols(union_set.begin(), union_set.end());
 
         BlockMap merged;
         for (auto& kv : lane_data) {

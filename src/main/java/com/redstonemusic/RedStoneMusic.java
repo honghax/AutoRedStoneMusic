@@ -7,6 +7,7 @@ import com.mojang.brigadier.context.CommandContext;
 import net.minecraft.commands.CommandSourceStack;
 import net.minecraft.commands.Commands;
 import net.minecraft.core.BlockPos;
+import net.minecraft.core.Direction;
 import net.minecraft.core.Vec3i;
 import net.minecraft.core.registries.Registries;
 import net.minecraft.nbt.CompoundTag;
@@ -18,6 +19,10 @@ import net.minecraft.resources.ResourceLocation;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.level.block.ButtonBlock;
+import net.minecraft.world.level.block.entity.CommandBlockEntity;
+import net.minecraft.world.level.block.state.properties.AttachFace;
 import net.minecraft.world.level.levelgen.structure.templatesystem.StructurePlaceSettings;
 import net.minecraft.world.level.levelgen.structure.templatesystem.StructureTemplate;
 import net.minecraft.world.phys.Vec3;
@@ -55,7 +60,7 @@ public class RedStoneMusic {
     private static final Map<String, PendingOnline> PENDING_ONLINE = new ConcurrentHashMap<>();
     private static final long ONLINE_CONFIRM_TTL_MS = 120000L;
 
-    private record PendingOnline(Path input, UUID player, long expiresAt) {}
+    private record PendingOnline(Path input, UUID player, long expiresAt, boolean instrumentHints) {}
 
     public RedStoneMusic(FMLJavaModLoadingContext context) {
         IEventBus modEventBus = context.getModEventBus();
@@ -113,7 +118,9 @@ public class RedStoneMusic {
             .then(Commands.argument("file", StringArgumentType.word())
                 .executes(context -> convert(context, getFile(context), "ai", false, true))
                 .then(Commands.literal("online")
-                    .executes(context -> convertOnline(context, getFile(context))))
+                    .executes(context -> convertOnline(context, getFile(context), false))
+                    .then(Commands.literal("inst")
+                        .executes(context -> convertOnline(context, getFile(context), true))))
                 .then(lanesNode("ai", false, true))
                 .then(Commands.literal("to")
                     .then(Commands.literal("ntb").executes(context -> convert(context, getFile(context), "ai", false, false))))
@@ -300,8 +307,10 @@ public class RedStoneMusic {
                     .executes(context -> cancelOnline(context, StringArgumentType.getString(context, "token")))));
     }
 
-    // Convert <file> online —— 先询问是否允许上传；点「是」后才联网。固定参数、默认多轨
-    private static int convertOnline(CommandContext<CommandSourceStack> context, String file) {
+    // Convert <file> online [inst] —— 先询问是否允许上传；点「是」后才联网。固定参数、默认多轨
+    // 不带 inst 时由模型自行判断乐器；带 inst 才发送乐器提示，按音符盒音色家族强分轨
+    private static int convertOnline(CommandContext<CommandSourceStack> context, String file,
+                                     boolean instrumentHints) {
         if (!ready(context)) return 0;
         try {
             Path input = storage.resolveMp3(file);
@@ -315,10 +324,15 @@ public class RedStoneMusic {
             long now = System.currentTimeMillis();
             PENDING_ONLINE.entrySet().removeIf(entry -> now > entry.getValue().expiresAt());
             String token = UUID.randomUUID().toString();
-            PENDING_ONLINE.put(token, new PendingOnline(input, playerId, now + ONLINE_CONFIRM_TTL_MS));
+            PENDING_ONLINE.put(token, new PendingOnline(input, playerId,
+                now + ONLINE_CONFIRM_TTL_MS, instrumentHints));
 
             context.getSource().sendSuccess(() -> Component.literal(
                 "是否允许把音频文件「" + input.getFileName() + "」上传至不受中国境内监管的网站？"), false);
+            if (instrumentHints) {
+                context.getSource().sendSuccess(() -> Component.literal(
+                    "已开启乐器提示：模型会按音符盒音色家族强制分离，民族乐器等素材可能失真"), false);
+            }
             Component yes = Component.literal("[是]").withStyle(style -> style
                 .withColor(ChatFormatting.GREEN)
                 .withClickEvent(new ClickEvent(ClickEvent.Action.RUN_COMMAND,
@@ -350,7 +364,7 @@ public class RedStoneMusic {
             return fail(context, "该命令需要玩家执行", e);
         }
         PENDING_ONLINE.remove(token);
-        return startOnline(context, pending.input());
+        return startOnline(context, pending.input(), pending.instrumentHints());
     }
 
     private static int cancelOnline(CommandContext<CommandSourceStack> context, String token) {
@@ -360,11 +374,14 @@ public class RedStoneMusic {
         return 1;
     }
 
-    private static int startOnline(CommandContext<CommandSourceStack> context, Path input) {
+    private static int startOnline(CommandContext<CommandSourceStack> context, Path input,
+                                   boolean instrumentHints) {
         String base = stripExtension(input.getFileName().toString());
-        Path output = storage.ntbDirectory().resolve(base + "_online_multi.ntb");
-        context.getSource().sendSuccess(
-            () -> Component.literal("开始在线多乐器转写: " + input.getFileName()), false);
+        Path output = storage.ntbDirectory().resolve(base + "_online_multi"
+            + (instrumentHints ? "_inst" : "") + ".ntb");
+        context.getSource().sendSuccess(() -> Component.literal(
+            (instrumentHints ? "开始在线乐器分轨转写: " : "开始在线多乐器转写: ")
+                + input.getFileName()), false);
         Consumer<String> progress = message -> {
             try {
                 ServerPlayer player = context.getSource().getPlayerOrException();
@@ -375,7 +392,8 @@ public class RedStoneMusic {
             }
         };
         Path finalInput = input;
-        toolRunner.convertOnlineAsync(finalInput, output, progress).whenComplete((result, error) -> {
+        toolRunner.convertOnlineAsync(finalInput, output, progress, instrumentHints)
+            .whenComplete((result, error) -> {
             ServerPlayer player;
             try {
                 player = context.getSource().getPlayerOrException();
@@ -503,11 +521,65 @@ public class RedStoneMusic {
             boolean ok = template.placeInWorld(level, origin, origin, new StructurePlaceSettings(), level.random, Block.UPDATE_ALL);
             if (!ok) throw new IOException("StructureTemplate 放置失败");
             LOGGER.info("PLACE 完成: {} origin={} size={}x{}x{}", path, origin, size.getX(), size.getY(), size.getZ());
-            context.getSource().sendSuccess(() -> Component.literal("已放置 " + path.getFileName() + "，尺寸 " + size.getX() + "x" + size.getY() + "x" + size.getZ()), true);
+            boolean station = addReturnStation(level, template, origin);
+            context.getSource().sendSuccess(() -> Component.literal("已放置 " + path.getFileName()
+                + "，尺寸 " + size.getX() + "x" + size.getY() + "x" + size.getZ()
+                + (station ? "，末端已放置返回按钮" : "")), true);
             return 1;
         } catch (Exception e) {
             return fail(context, "放置失败: " + e.getMessage(), e);
         }
+    }
+
+    /**
+     * 放置后在结构末端补一个「点击传送回起点」的命令方块 + 石按钮。
+     *
+     * <p>不写进 NBT，避免结构文件依赖块实体序列化；终点取结构里 x 最大的终点灯，
+     * 起点取结构里的拉杆，命令用相对坐标，因此与放置位置无关。</p>
+     *
+     * @return 是否成功放置返回按钮
+     */
+    private static boolean addReturnStation(ServerLevel level, StructureTemplate template,
+                                            BlockPos origin) {
+        StructurePlaceSettings settings = new StructurePlaceSettings();
+        BlockPos lever = null;
+        for (StructureTemplate.StructureBlockInfo info : template.filterBlocks(origin, settings, Blocks.LEVER)) {
+            if (lever == null || info.pos().getX() < lever.getX()) lever = info.pos();
+        }
+        BlockPos lamp = null;
+        for (StructureTemplate.StructureBlockInfo info : template.filterBlocks(origin, settings, Blocks.REDSTONE_LAMP)) {
+            if (lamp == null || info.pos().getX() > lamp.getX()
+                || (info.pos().getX() == lamp.getX()
+                    && Math.abs(info.pos().getZ()) < Math.abs(lamp.getZ()))) {
+                lamp = info.pos();
+            }
+        }
+        if (lever == null || lamp == null) return false;
+
+        // 时间轴沿 +x 增长：终点灯后留一格再接命令方块；折叠布局下 +x 可能压到别的层，
+        // 因此往后找第一个上下都为空气的位置，找不到才退回 +2
+        BlockPos cmdPos = lamp.offset(2, 0, 0);
+        for (int dx = 2; dx <= 8; ++dx) {
+            BlockPos candidate = lamp.offset(dx, 0, 0);
+            if (level.getBlockState(candidate).isAir() && level.getBlockState(candidate.above()).isAir()) {
+                cmdPos = candidate;
+                break;
+            }
+        }
+        if (level.getBlockState(cmdPos.below()).isAir()) {
+            level.setBlock(cmdPos.below(), Blocks.SMOOTH_QUARTZ.defaultBlockState(), Block.UPDATE_ALL);
+        }
+        level.setBlock(cmdPos, Blocks.COMMAND_BLOCK.defaultBlockState(), Block.UPDATE_ALL);
+        if (level.getBlockEntity(cmdPos) instanceof CommandBlockEntity command) {
+            command.getCommandBlock().setCommand("tp @p ~" + (lever.getX() - cmdPos.getX())
+                + " ~" + (lever.getY() - cmdPos.getY())
+                + " ~" + (lever.getZ() - cmdPos.getZ()));
+            command.setChanged();
+        }
+        level.setBlock(cmdPos.above(), Blocks.STONE_BUTTON.defaultBlockState()
+            .setValue(ButtonBlock.FACE, AttachFace.FLOOR)
+            .setValue(ButtonBlock.FACING, Direction.NORTH), Block.UPDATE_ALL);
+        return true;
     }
 
     private static boolean ready(CommandContext<CommandSourceStack> context) {

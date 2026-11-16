@@ -17,6 +17,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.Base64;
+import java.util.List;
 import java.util.Locale;
 import java.util.UUID;
 import java.util.function.Consumer;
@@ -34,18 +35,36 @@ public final class MuscriptorClient {
     private static final int MAX_ATTEMPTS = 12;
     private static final long RETRY_DELAY_MS = 5000L;
 
+    /**
+     * 乐器提示词表：全部落在音符盒已有的音色家族上（弦乐/贝斯/竖琴/色彩打击/管乐/
+     * 铜管/齐奏/合成主音/鼓）。仅作为可选选项使用，民族乐器等素材不指定更稳妥。
+     */
+    public static final List<String> INSTRUMENT_HINTS = List.of(
+        "orchestral_harp", "electric_bass", "chromatic_percussion", "flutes",
+        "acoustic_guitar", "brass_section", "orchestra_hit", "synth_lead", "drums");
+
     private final HttpClient http = HttpClient.newBuilder()
         .connectTimeout(Duration.ofSeconds(30))
         .followRedirects(HttpClient.Redirect.NORMAL)
         .build();
 
-    /** 上传音频并等待在线转写完成的 MIDI。 */
+    /** 上传音频并等待在线转写完成的 MIDI（不指定乐器，由模型自行判断）。 */
     public Path transcribe(Path audio, Path midiOut, Consumer<String> progress)
+            throws IOException, InterruptedException {
+        return transcribe(audio, midiOut, progress, List.of());
+    }
+
+    /** 上传音频并等待在线转写完成的 MIDI；instruments 非空时按提示乐器做条件化分离。 */
+    public Path transcribe(Path audio, Path midiOut, Consumer<String> progress,
+                           List<String> instruments)
             throws IOException, InterruptedException {
         String endpoint = System.getProperty("redstonemusic.muscriptor.endpoint", DEFAULT_ENDPOINT);
         String boundary = "----RedStoneMusic" + UUID.randomUUID().toString().replace("-", "");
-        byte[] body = multipart(audio, boundary);
+        byte[] body = multipart(audio, boundary, instruments);
         String clientId = UUID.randomUUID().toString();
+        if (!instruments.isEmpty()) {
+            progress.accept("已按乐器提示上传：" + String.join(", ", instruments));
+        }
 
         for (int attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
             progress.accept("在线转写尝试 " + attempt + "/" + MAX_ATTEMPTS + "...");
@@ -106,10 +125,18 @@ public final class MuscriptorClient {
         throw new IOException("MuScriptor 事件流结束但没有返回 MIDI");
     }
 
-    private static byte[] multipart(Path audio, String boundary) throws IOException {
+    private static byte[] multipart(Path audio, String boundary, List<String> instruments)
+            throws IOException {
         String name = audio.getFileName().toString();
         byte[] file = Files.readAllBytes(audio);
-        ByteArrayOutputStream out = new ByteArrayOutputStream(file.length + 256);
+        ByteArrayOutputStream out = new ByteArrayOutputStream(file.length + 512);
+        // 乐器提示是重复的同名字段，必须在文件之前；为空时保持原样的纯文件上传
+        for (String instrument : instruments) {
+            String field = "--" + boundary + "\r\n"
+                + "Content-Disposition: form-data; name=\"instruments\"\r\n\r\n"
+                + instrument + "\r\n";
+            out.write(field.getBytes(StandardCharsets.UTF_8));
+        }
         String head = "--" + boundary + "\r\n"
             + "Content-Disposition: form-data; name=\"file\"; filename=\"" + name + "\"\r\n"
             + "Content-Type: " + mimeFor(name) + "\r\n\r\n";

@@ -226,9 +226,13 @@ public final class MusicToolRunner implements AutoCloseable {
      *
      * <p>该链路只使用固定参数（instrument 分轨、resolution 2、lane-gap 2），
      * 不额外接收命令参数；轨道数由转写结果中的乐器数决定。</p>
+     *
+     * <p>instrumentHints 为 true 时才在请求里带上乐器提示，让模型按音符盒已有的
+     * 音色家族分离；不指定时由模型自行判断（民族乐器等素材更稳妥）。</p>
      */
     public CompletableFuture<Path> convertOnlineAsync(Path input, Path output,
-                                                      Consumer<String> progress) {
+                                                      Consumer<String> progress,
+                                                      boolean instrumentHints) {
         return CompletableFuture.supplyAsync(() -> {
             Path jobDirectory;
             try {
@@ -238,7 +242,8 @@ public final class MusicToolRunner implements AutoCloseable {
             }
             try {
                 Path midi = jobDirectory.resolve("online.mid");
-                new MuscriptorClient().transcribe(input, midi, progress);
+                new MuscriptorClient().transcribe(input, midi, progress,
+                    instrumentHints ? MuscriptorClient.INSTRUMENT_HINTS : List.of());
                 // 在线模型会在开头补静音/补齐小节，这里把首个音符对齐到原曲实际起音
                 double lead = detectOnsetSeconds(input, jobDirectory,
                     workDirectory.resolve("ffmpeg.exe"));

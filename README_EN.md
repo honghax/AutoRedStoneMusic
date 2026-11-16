@@ -4,6 +4,8 @@ A Forge mod and local toolchain that converts ordinary audio into playable Minec
 
 AutoRedStoneMusic takes an MP3 or WAV file and turns it into a Minecraft Structure NBT file containing note blocks and redstone timing. The generated structure can be saved, shared, loaded again, and placed directly in front of the player from inside Minecraft.
 
+> **Update (2026-11-16)**: The online path gained an **optional instrument hint** (`Convert <song> online inst`), which forces separation along instrument families the note block can actually play. Instrument pads expanded from 4 to **all 16 vanilla note block instruments** (bass / didgeridoo / guitar / banjo / harp / bit / flute / xylophone / iron_xylophone / cow_bell / bell / chime / pling + basedrum / snare / hat), with automatic GM program and drum-key mapping. The start bus is now **segmented with repeaters plus per-lane column padding**, so 6–8 lanes still start on the same tick. After placement, a **return button** (command block + stone button) is added at the end of every structure to teleport back to the start.
+
 > **Update (2026-11-14)**: **Separation algorithm rewritten.** HPSS → REPET-SIM (kNN) → STFT-domain smooth crossovers; WOLA edge spikes and a dust-run false positive are fixed, `midi_to_nbt` gained `--poly-cap`, and single-track transposition is now octave-only. A "three-role separation + note-level fusion" experiment scored better on metrics but sounded noticeably thinner in listening tests, so it has been **reverted**; the traditional engine still transcribes six stems and merges them.
 
 > **Update (2026-11-08)**: Added **optional online multi-instrument transcription**. `Convert <song> online` sends the audio to a publicly deployed online model, receives an instrument-tagged MIDI, and generates an **instrument-per-lane structure** (lane count = number of instruments). A Yes/No confirmation appears in chat first; the command branch takes no extra parameters and places the structure automatically when finished.
@@ -38,7 +40,11 @@ AutoRedStoneMusic takes an MP3 or WAV file and turns it into a Minecraft Structu
 - **New: unified building material** — all structural support/strip-gap blocks now use `minecraft:smooth_quartz`; only the instrument pads directly under note blocks (`dirt` / `bamboo_planks` / `gold_block`) and the functionally required `glowstone` in folded layouts are preserved.
 - **New: C++17 fast toolchain** — `midi_to_nbt`, `arrange_multilane`, and `merge_midis` were rewritten from Python/PyInstaller in C++17. Output matches the originals, speedups are about 53×–145×, and the mod JAR is about 54 MB smaller.
 - **New: NTB → NBS export** — the standalone C++ tool `ntb_to_nbs.exe` converts a generated structure into a Note Block Studio `.nbs` file (v4, 20 TPS) for inspection, editing, and sharing.
-- **New: optional online multi-instrument transcription** — `Convert <song> online` uses a publicly deployed online model, so no local inference model is needed. The result becomes an instrument-per-lane structure (`bass / harp / bell / basedrum`, lane count = number of instruments present). Uploading requires a Yes/No confirmation in chat; choosing No uploads nothing.
+- **New: optional online multi-instrument transcription** — `Convert <song> online` uses a publicly deployed online model, so no local inference model is needed. The result becomes an instrument-per-lane structure (lane count = number of instruments present). Uploading requires a Yes/No confirmation in chat; choosing No uploads nothing.
+- **New: optional instrument hint (`online inst`)** — by default the online model picks instruments itself; adding `inst` sends hints so it separates along instrument families the note block can play. Ethnic or solo material is better left without hints.
+- **New: all 16 vanilla note block instruments** — besides the original bass / harp / bell / basedrum, the generator now emits didgeridoo / guitar / banjo / bit / flute / xylophone / iron_xylophone / cow_bell / chime / pling / snare / hat, each with its correct pad and base pitch; GM programs and drum keys map to the closest instrument family.
+- **New: segmented start bus + per-lane padding** — redstone dust carries a signal for only 15 blocks with zero delay, so a repeater (delay = one column) is inserted every 14 blocks and nearer lanes are padded with empty columns; every lane still starts on the same tick, and bell no longer has to merge into harp for 6–8 lanes.
+- **New: end-of-structure return button** — after placement, a command block plus stone button is added after the final lamp; clicking it teleports back to the lever with relative coordinates. It is not written into the NBT, so structure files stay unchanged.
 - **New: separation algorithm rewritten** — HPSS first splits percussive/harmonic, vocals use a kNN REPET-SIM soft mask (96 log bands, similar-frame averaging), and band splitting moved into the STFT domain with smooth crossovers and zero padding to remove edge spikes. The six-stem output and per-stem-then-merge flow are unchanged.
 
 ## Pipeline
@@ -138,12 +144,12 @@ Multi-instrument MIDI (each instrument keeps its own track / program)
    |
    v
 arrange_multilane.exe --split instrument
-   ├─ Lanes by instrument: bass / harp / bell / basedrum
-   ├─ Lane count = number of instruments
-   └─ If the shared bus would be too long: merge bell into harp
+   ├─ GM programs / drum keys → 16 vanilla note block instruments
+   ├─ Lane count = number of instruments actually present (usually 6–8)
+   └─ A repeater every 14 bus blocks; nearer lanes padded to start together
    |
    v
-Shared start bus + Minecraft Structure NBT (placed automatically)
+Shared start bus + Minecraft Structure NBT (placed automatically, with a return button)
 ```
 
 The project is split into the following independent Windows tools:
@@ -225,6 +231,8 @@ This `redstonemusic/tools/` path is created inside the temporary runtime workspa
 
 ## In-Game Commands
 
+> **Update (2026-11-16)**: The `online` branch gained an optional `inst` node: `Convert <song> online inst` sends instrument hints and splits lanes strictly by the 16 note block instruments; omitting `inst` lets the online model decide. Every placed structure now gets a command block + stone button at its end that teleports back to the start (requires command blocks / cheats to be enabled).
+
 > **Update (2026-11-14)**: Command syntax is unchanged. `trad true` uses the rewritten separation algorithm (still six stems, transcribed per stem and merged). Single-track and multi-track NBT generation both pass `--poly-cap 13` (keeps the highest notes instead of failing when a branch bus exceeds 15 blocks). Single-track transposition is now octave-only.
 
 > **Update (2026-11-08)**: `Convert` gained an `online` branch: `Convert <song> online`. It takes no other command parameters; it first asks in chat whether uploading the audio is allowed, converts online only after clicking Yes, then builds instrument lanes and places the structure automatically. Output file: `<name>_online_multi.ntb`.
@@ -252,6 +260,7 @@ The commands require permission level 2. Lowercase compatibility commands are al
 /RedStoneMusic Convert song.mp3 true lanes 3 poly 8
 /RedStoneMusic Convert song.mp3 trad true lanes 3 split bank poly 12
 /RedStoneMusic Convert song.mp3 online
+/RedStoneMusic Convert song.mp3 online inst
 /RedStoneMusic place song.ntb
 /RedStoneMusic debug place <structure>
 ```
@@ -274,9 +283,37 @@ Commands:
 - `Convert song.mp3 lanes 3 split bank`: Assigns lanes by `bass / harp / bell` timbre instead of pitch-balanced splitting.
 - `Convert song.mp3 true lanes 3 ...`: Runs AI separation first, then builds 3 lanes from the merged final MIDI.
 - `Convert song.mp3 trad true lanes 3 ...`: Traditional separation plus 3 lanes.
-- `Convert song.mp3 online`: Uses a publicly deployed online model for **multi-instrument transcription** and produces an **instrument-per-lane structure** (lane count = number of instruments: `bass / harp / bell / basedrum`), then places it automatically. No other parameters are accepted. A Yes/No confirmation appears in chat, and the audio is uploaded only after clicking Yes. Requires network access and has no local fallback.
+- `Convert song.mp3 online`: Uses a publicly deployed online model for **multi-instrument transcription** and produces an **instrument-per-lane structure** (lane count = number of instruments), then places it automatically. No other parameters are accepted. A Yes/No confirmation appears in chat, and the audio is uploaded only after clicking Yes. Requires network access and has no local fallback.
+- `Convert song.mp3 online inst`: Same, but sends **instrument hints** so the model separates along the instrument families the note block can play; ethnic or solo material is better left without hints.
 
-Generated file names follow `<name>_<engine>_<multi-track>[_L<N>][_bank][_P<cap>].ntb`, e.g. `a_ai_false.ntb` for a single-track AI conversion, `a_trad_true.ntb` for a traditional multi-track conversion, `a_ai_false_L3.ntb` for 3 lanes with pitch/poly20, or `a_ai_false_L3_bank_P8.ntb` for 3 lanes with bank/poly8. Online conversion writes `<name>_online_multi.ntb`. Only a single file name inside the configured directory is accepted. The mod validates extensions and rejects path traversal attempts.
+Generated file names follow `<name>_<engine>_<multi-track>[_L<N>][_bank][_P<cap>].ntb`, e.g. `a_ai_false.ntb` for a single-track AI conversion, `a_trad_true.ntb` for a traditional multi-track conversion, `a_ai_false_L3.ntb` for 3 lanes with pitch/poly20, or `a_ai_false_L3_bank_P8.ntb` for 3 lanes with bank/poly8. Online conversion writes `<name>_online_multi.ntb`, or `<name>_online_multi_inst.ntb` with instrument hints. Only a single file name inside the configured directory is accepted. The mod validates extensions and rejects path traversal attempts.
+
+After placement, a command block and stone button are added at the end of the structure (after the final lamp); clicking the button teleports back to the lever start. The button does nothing when command blocks are disabled (single-player without cheats, or `enable-command-block=false`).
+
+## Note Block Instruments and Pads (expanded 2026-11-16)
+
+Each instrument spans 25 semitones (two octaves + 1); notes outside that range fold back by ±12.
+
+| Instrument | Pad | Base pitch (note 0) |
+| --- | --- | --- |
+| bass | `bamboo_planks` | F#1 |
+| didgeridoo | `pumpkin` | F#1 |
+| guitar | `white_wool` | F#2 |
+| banjo | `hay_block` | F#3 |
+| harp | `dirt` | F#3 |
+| bit | `emerald_block` | F#3 |
+| flute | `clay` | F#4 |
+| xylophone | `bone_block` | F#4 |
+| iron_xylophone | `iron_block` | F#4 |
+| cow_bell | `soul_sand` | F#4 |
+| bell | `gold_block` | F#5 |
+| chime | `packed_ice` | F#5 |
+| pling | `glowstone` | F#5 |
+| basedrum | `stone` | pitchless (note fixed at 0) |
+| snare | `sand` | pitchless (note fixed at 0) |
+| hat | `glass` | pitchless (note fixed at 0) |
+
+GM programs and drum keys map by family onto the table above: piano/strings/voices → harp, guitar → guitar, bass → bass, brass → didgeridoo, reeds/pipes → flute, chromatic percussion → xylophone, synth lead → bit, synth pad → pling, ethnic → banjo, timpani → basedrum.
 
 ## Test Results
 
@@ -298,6 +335,19 @@ The chroma / top-1 / top-3 numbers used in this repo are **systematically biased
 - **Evidence:** the three-role + note-fusion variant scored highest (top-1 42.9%) yet sounded clearly thinner than the six-stem merge.
 
 Conclusion: these metrics are only for **longitudinal comparison on the same material with the same alignment**. Whether something sounds right must be judged by listening.
+
+### Instrument Lanes and Bus Segmentation (2026-11-16)
+
+| Item | Result |
+| --- | --- |
+| Online multi-instrument transcription (with hints, 8-lane material) | 8 lanes, 2342 note blocks |
+| Instrument distribution | bass 186 / guitar 973 / bit 35 / flute 80 / xylophone 311 / basedrum 115 / snare 90 / hat 552 |
+| Self-check | Size 2703×2×53, unreachable 0, note-block/dust adjacency 0 |
+| Segmented bus (4 lanes, z=±71) | 8 repeaters, delays 8/2/2/8, padding 0/6/6/0, unreachable 0 |
+| Segmented bus (3 lanes, z=±28) | 1 repeater per side, unreachable 0 |
+| Regression without repeaters (4 lanes, z=±14) | Block and note-block counts identical to before the change |
+
+All of the above were auditioned in-game and confirmed to stay in sync.
 
 The conversion time below means the complete pipeline from input audio through decoding, ONNX inference, MIDI writing, NBT generation, and final output completion.
 
